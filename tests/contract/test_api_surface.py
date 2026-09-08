@@ -31,6 +31,9 @@ PINS = {
     "0.25": {
         "attention_metadata_module": "vllm.v1.attention.backend",
     },
+    "0.28": {
+        "attention_metadata_module": "vllm.v1.attention.backend",
+    },
 }
 
 _vllm = pytest.importorskip("vllm")
@@ -62,7 +65,7 @@ def test_vllm_version_pin() -> None:
     minor = ".".join(version.split(".")[:2])
     assert minor in PINS, (
         f"gonka-poc targets vllm {', '.join(sorted(PINS))}, got {version!r}. "
-        f"The plugin pin (vllm>=0.25.0,<0.26) admits wheels this "
+        f"The plugin pin (vllm>=0.25.0,<0.29) admits wheels this "
         f"suite has not vetted."
     )
 
@@ -563,10 +566,10 @@ def test_sampling_params_has_fork_patches() -> None:
     admission.
 
     Why this test belongs in the PLUGIN contract suite (not just the fork):
-        The plugin advertises ``vllm>=0.25.0,<0.26`` as its
-        install pin. A vanilla ``pip install`` of a 0.25.x wheel (no
+        The plugin advertises ``vllm>=0.25.0,<0.29`` as its
+        install pin. A vanilla ``pip install`` of a supported wheel (no
         ``+gonka.sampler``) satisfies that pin -- and the other contract
-        tests stay GREEN against vanilla vllm 0.25, but engine startup
+        tests stay GREEN against vanilla vllm, but engine startup
         crashes the moment a request with ``logprobs_mode`` arrives. This
         pin catches that misconfiguration BEFORE production.
 
