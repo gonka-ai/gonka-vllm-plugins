@@ -60,12 +60,9 @@ _borrow_available: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 async def poc_validation_available(engine_client: Any) -> bool:
     """Probe (once per engine client) whether borrowed-lease validation is on.
 
-    Three gates, all required:
-      * every worker rank reports ``scratch_capable=False`` — on
-        scratch-capable (bf16-KV) configs the fleet's artifacts depend on
-        the legacy KV-scratch derivation path, and a leased forward would
-        derive different vectors -- beyond the validation tolerance, not
-        within it (ADR-0015, Decision 5);
+    Two gates, both required (the legacy KV-scratch gate died with the
+    prefill scheme — decode always prefills into a fresh buffer, decision
+    #12, so a leased forward is bit-safe by construction):
       * the borrow RPC surface answers (a zero-block borrow returns None
         without raising — proves the injected EngineCore methods and the
         utility transport);
@@ -84,15 +81,10 @@ async def poc_validation_available(engine_client: Any) -> bool:
     compat = _compat_current()
     available = False
     try:
-        ranks = await engine_client.collective_rpc(
-            "execute_poc_borrow_compat", timeout=30)
-        scratch_capable = any(
-            (r or {}).get("scratch_capable", True) for r in ranks)
-        if not scratch_capable:
-            # Zero-block borrow: exercises the full RPC path; returns None
-            # (needed <= 0) iff the surface is present and reachable.
-            await compat.borrow_poc_blocks(engine_client, 0, 1)
-            available = True
+        # Zero-block borrow: exercises the full RPC path; returns None
+        # (needed <= 0) iff the surface is present and reachable.
+        await compat.borrow_poc_blocks(engine_client, 0, 1)
+        available = True
     except Exception as exc:
         logger.warning(
             "PoC borrow availability probe failed — validation will use the "
@@ -201,7 +193,7 @@ async def poc_reservation(
                 engine_client, num_nonces, seq_len, timeout_ms)
         else:
             # Legacy path from the start: abort once here; the per-chunk
-            # re-abort in _execute_poc_forward_rpc keeps later admissions
+            # re-abort in _execute_poc_decode_rpc keeps later admissions
             # out of the clobber range.
             lease = None
             try:

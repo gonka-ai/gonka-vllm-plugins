@@ -12,9 +12,8 @@ from .config import (
     POC_MAX_QUEUED_NONCES,
 )
 from .reservation import poc_reservation
-from .validation import run_validation
 from .callbacks import get_callback_queue, clear_callback_queue
-from .data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD, wire_encoding
+from .data import DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD, fraud_test, wire_encoding
 
 logger = init_logger(__name__)
 
@@ -34,9 +33,9 @@ class GenerateJob:
     seq_len: int
     k_dim: int
     batch_size: int
-    poc_stronger_rng: bool = False
-    validation_artifacts: Optional[Dict[int, str]] = None
-    stat_test_dist_threshold: float = DEFAULT_DIST_THRESHOLD
+    max_tokens: int = 0
+    route_window: int = 256
+    enforced_k_steps: Optional[Dict[int, List[int]]] = None
     stat_test_p_mismatch: float = DEFAULT_P_MISMATCH
     stat_test_fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
     callback_url: Optional[str] = None
@@ -206,9 +205,12 @@ class GenerateQueue:
         logger.info("Generate queue worker stopped")
     
     async def _process_job(self, job: GenerateJob) -> Dict[str, Any]:
-        """Process a single generate job."""
+        """Process a single generate job (decode-PoC chunks)."""
+        from .decode_runner import POC_DECODE_MAX_BATCH
+        chunk_size = min(job.batch_size or POC_DECODE_MAX_BATCH,
+                         POC_DECODE_MAX_BATCH)
         total_nonces = len(job.nonces)
-        n_chunks = (total_nonces + job.batch_size - 1) // job.batch_size
+        n_chunks = (total_nonces + chunk_size - 1) // chunk_size
         logger.info(f"PoC queue job {job.request_id[:8]}: {total_nonces} nonces, batch_size={job.batch_size}, chunks={n_chunks}")
         
         start_time = time.time()
@@ -217,12 +219,22 @@ class GenerateQueue:
         # One lease per job, reused across chunks; lease=None ⇒ inference
         # already aborted, legacy in-place layout — see poc_reservation.
         # The reservation lock also arbitrates with concurrent wait=True requests.
+        mismatch_total = 0
+        steps_total = 0
+        validating = job.enforced_k_steps is not None
+        n_eq = max(1, -(-total_nonces // chunk_size))
+        base, rem = divmod(total_nonces, n_eq)
+        bounds = []
+        off = 0
+        for ci in range(n_eq):
+            size = base + (1 if ci < rem else 0)
+            bounds.append((off, off + size))
+            off += size
         async with poc_reservation(
-            job.engine_client, job.batch_size, job.seq_len,
+            job.engine_client, chunk_size, job.seq_len + job.max_tokens,
         ) as lease:
-            for i in range(0, total_nonces, job.batch_size):
-                chunk = job.nonces[i:i + job.batch_size]
-                chunk_idx = i // job.batch_size
+            for chunk_idx, (lo, hi) in enumerate(bounds):
+                chunk = job.nonces[lo:hi]
 
                 while True:
                     if self._stop_event.is_set():
@@ -235,17 +247,19 @@ class GenerateQueue:
                     try:
                         # Lazy import: routes.py imports GenerateJob/queue
                         # from this module.
-                        from .routes import _execute_poc_forward_rpc
+                        from .routes import _execute_poc_decode_rpc
                         result = await asyncio.wait_for(
-                            _execute_poc_forward_rpc(
+                            _execute_poc_decode_rpc(
                                 job.engine_client,
                                 nonces=chunk,
                                 block_hash=job.block_hash,
                                 public_key=job.public_key,
                                 seq_len=job.seq_len,
-                                k_dim=job.k_dim,
-                                poc_stronger_rng=job.poc_stronger_rng,
-                                timeout_ms=int(POC_GENERATE_CHUNK_TIMEOUT_SEC * 1000),
+                                max_tokens=job.max_tokens,
+                                route_window=job.route_window,
+                                enforced_k_steps=(
+                                    {n: job.enforced_k_steps[n] for n in chunk}
+                                    if validating else None),
                                 lease=lease,
                             ),
                             timeout=POC_GENERATE_CHUNK_TIMEOUT_SEC
@@ -257,6 +271,9 @@ class GenerateQueue:
                         raise RuntimeError(f"Timeout waiting for engine RPC: chunk {chunk_idx}")
 
                     computed_artifacts.extend(result.get("artifacts", []))
+                    steps_total += int(result.get("steps_total") or 0)
+                    if validating:
+                        mismatch_total += int(result.get("mismatch_total") or 0)
                     logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
                     break
         
@@ -264,28 +281,30 @@ class GenerateQueue:
         rate = total_nonces / elapsed if elapsed > 0 else 0
         logger.info(f"PoC queue job {job.request_id[:8]} completed: {total_nonces} nonces in {elapsed:.2f}s ({rate:.0f}/s)")
         
-        if job.validation_artifacts is None:
+        encoding = wire_encoding(job.k_dim)
+        encoding["route_window"] = job.route_window
+        encoding["seq_len"] = job.seq_len
+        encoding["max_tokens"] = job.max_tokens
+        if not validating:
             return {
                 "status": "completed",
                 "request_id": job.request_id,
                 "artifacts": computed_artifacts,
-                "encoding": wire_encoding(job.k_dim),
+                "encoding": encoding,
             }
-        
-        validation_result = run_validation(
-            computed_artifacts=computed_artifacts,
-            validation_map=job.validation_artifacts,
-            n_total=len(job.nonces),
-            dist_threshold=job.stat_test_dist_threshold,
+
+        p_value, fraud = fraud_test(
+            n_mismatch=mismatch_total, n_total=steps_total,
             p_mismatch=job.stat_test_p_mismatch,
-            fraud_threshold=job.stat_test_fraud_threshold,
-            k_dim=job.k_dim,
-        )
-        
+            fraud_threshold=job.stat_test_fraud_threshold)
         return {
             "status": "completed",
             "request_id": job.request_id,
-            **validation_result,
+            "artifacts": computed_artifacts,
+            "encoding": encoding,
+            "n_mismatch": mismatch_total, "n_total": steps_total,
+            "mismatch_rate": (mismatch_total / steps_total) if steps_total else 0.0,
+            "p_value": p_value, "fraud_detected": fraud,
         }
     
     def _enqueue_callback(self, job: GenerateJob, result: Dict[str, Any]):

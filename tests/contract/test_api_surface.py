@@ -176,7 +176,7 @@ def test_engine_client_runtime_surface() -> None:
             consumed by:
               * src/gonka_poc/poc/routes.py (compute artifacts per chunk)
               * src/gonka_poc/worker/extension.py
-                (await async_llm.collective_rpc("execute_poc_forward", ...))
+                (await async_llm.collective_rpc("execute_poc_decode", ...))
             -- the PoC dispatch path. If kwargs is renamed/reshaped, every
             PoC forward fails.
 
@@ -209,7 +209,7 @@ def test_engine_client_runtime_surface() -> None:
     assert collective_rpc is not None and callable(collective_rpc), (
         "EngineClient.collective_rpc missing -- "
         "src/gonka_poc/poc/routes.py and src/gonka_poc/worker/extension.py "
-        "issue ``await engine_client.collective_rpc('execute_poc_forward', ...)`` "
+        "issue ``await engine_client.collective_rpc('execute_poc_decode', ...)`` "
         "on every PoC round; without it the PoC dispatch path is dead."
     )
     assert inspect.iscoroutinefunction(collective_rpc), (

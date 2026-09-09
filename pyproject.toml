@@ -58,6 +58,9 @@ gonka_poc = "gonka_poc.plugin:register"
 [project.scripts]
 gonka-vllm-serve = "gonka_poc.entrypoint.api_router:main"
 
+[tool.setuptools.package-data]
+"gonka_poc.poc" = ["sphere_codebook.pt"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["gonka_poc*"]

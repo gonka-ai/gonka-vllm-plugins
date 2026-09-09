@@ -105,9 +105,11 @@ def _make_body() -> Any:
 
         body.block_hash, body.block_height, body.public_key, body.node_id,
         body.node_count, body.group_id, body.n_groups, body.batch_size,
-        body.params (with .model/.seq_len/.k_dim), body.url, body.poc_stronger_rng
+        body.params (with .model/.seq_len/.k_dim/.max_tokens/.route_window),
+        body.url
     """
-    params = MagicMock(model="m", seq_len=8, k_dim=12)
+    params = MagicMock(model="m", seq_len=8, k_dim=12, max_tokens=4,
+                       route_window=256)
     body = MagicMock(
         block_hash="bh",
         block_height=1,
@@ -119,7 +121,6 @@ def _make_body() -> Any:
         batch_size=1,
         params=params,
         url=None,
-        poc_stronger_rng=False,
     )
     return body
 

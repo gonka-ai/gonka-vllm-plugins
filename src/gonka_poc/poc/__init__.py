@@ -7,8 +7,8 @@ path, e.g.::
 
     from gonka_poc.poc.routes import router as poc_router
     from gonka_poc.poc.data import encode_vector, decode_vector
-    from gonka_poc.poc.poc_model_runner import execute_poc_forward
+    from gonka_poc.poc.decode_runner import execute_poc_decode
 
-PoC dispatch is via ``collective_rpc("execute_poc_forward", kwargs=...)``
+PoC dispatch is via ``collective_rpc("execute_poc_decode", kwargs=...)``
 on :class:`gonka_poc.worker.PoCWorkerExtension`.
 """

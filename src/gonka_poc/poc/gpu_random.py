@@ -14,9 +14,13 @@ validation. Bitwise equality of outputs is neither required nor checked.
 """
 import hashlib
 import math
-from typing import List
+from typing import List, Optional
+
+import logging
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def _seed_from_string(seed_string: str) -> int:
@@ -138,15 +142,14 @@ def generate_inputs(
     device: torch.device,
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """Generate deterministic input embeddings for PoC."""
-    batch_size = len(nonces)
-    result = torch.empty(batch_size, seq_len, dim, device=device, dtype=dtype)
-    for i, nonce in enumerate(nonces):
-        seed_str = f"{block_hash}_{public_key}_nonce{nonce}"
-        seed = _seed_from_string(seed_str)
-        normal = _normal(seed, seq_len * dim, device)
-        result[i] = normal.view(seq_len, dim).to(dtype)
-    return result
+    """Generate deterministic input embeddings for PoC.
+
+    Batched: ONE _batched_normal over all nonces instead of a serial per-nonce
+    Python loop (which was ~B sequential big RNGs on the prefill critical path).
+    Per-row identical to the old loop (same seed -> same murmur -> same normals)."""
+    seeds = [_seed_from_string(f"{block_hash}_{public_key}_nonce{n}") for n in nonces]
+    normals = _batched_normal(seeds, seq_len * dim, device)  # [B, seq_len*dim]
+    return normals.view(len(nonces), seq_len, dim).to(dtype)
 
 
 def generate_inputs_concat_murmur(
@@ -240,18 +243,29 @@ def random_pick_indices(
     dim: int,
     k: int,
     device: torch.device,
+    prev_point_ids: Optional[List[int]] = None,
+    step: int = 0,
 ) -> torch.Tensor:
-    """Pick k dimensions per nonce deterministically (vectorized)."""
+    """Pick k dimensions per nonce deterministically (vectorized).
+
+    When prev_point_ids is provided the seed is mixed with the previous
+    sphere index so decode steps pick a different subset than prefill.
+    """
     if k <= 0 or k > dim:
         raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
 
     batch_size = len(nonces)
 
     seeds = []
-    for nonce in nonces:
-        seeds.append(_seed_from_string(
-            f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
-        ))
+    for i, nonce in enumerate(nonces):
+        if prev_point_ids is None:
+            seeds.append(_seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}"
+            ))
+        else:
+            seeds.append(_seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}_k_{prev_point_ids[i]}"
+            ))
 
     all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
     seed_tensor = torch.tensor(seeds, dtype=torch.int64, device=device).unsqueeze(1)
@@ -293,3 +307,413 @@ def apply_haar_rotation(
         y = y - 2 * dot * v_batch
 
     return y
+
+
+# ============================================================================
+# Decode-PoC family — ported bit-for-bit from the 0.20 in-tree branch
+# (poc-v0.20-decode-poc-cg @ 5c1d09f55e92).  CONSENSUS-CRITICAL: seed strings,
+# salts, murmur3 pipeline and the routing window define the k-trajectories.
+# Decisions applied (see migration NOTES.md):
+#   * #1/#4 — the decode seed scheme is the ONLY scheme in this release:
+#     random_pick_indices above is the 0.20 variant (suffix `_decode{step}`,
+#     optional `_k_{prev}`); the legacy `_pick_{k}` seeding lives in tag v0.1.x.
+#   * #11 — the routing window ships as 256 via the request (set_route_window).
+# ============================================================================
+
+
+_SALT_DECODE_EMBED = 0x0D
+
+
+_SALT_DECODE_PICK = 0x91
+
+
+_MIX_A = 0x9E3779B1  # golden-ratio odd constant
+
+
+_MIX_B = 0x85EBCA77
+
+
+def pinned_to_device(vals, dtype, device):
+    """Build a small [N] device tensor from a host sequence WITHOUT stalling the
+    async pipeline.
+
+    `torch.tensor(list, device='cuda')` — and indexing a CUDA tensor with a Python
+    list — construct on-device via a BLOCKING host->device copy that synchronizes
+    on the compute stream. Under async scheduling that stalls every decode step on
+    the model forward (measured ~17 ms/step; see the decode-PoC tail). Building a
+    pinned host tensor and copying non_blocking avoids the sync. The values are
+    identical to the direct construction, so PoC artifacts stay bit-for-bit the
+    same — do NOT "simplify" this back to torch.tensor(..., device=cuda).
+    """
+    cuda = torch.device(device).type == "cuda"
+    return torch.tensor(vals, dtype=dtype, pin_memory=cuda).to(device, non_blocking=cuda)
+
+
+def _batched_normal_t(seeds: torch.Tensor, n: int, device: torch.device) -> torch.Tensor:
+    """Like _batched_normal but `seeds` is already an int64 tensor [B] (no host
+    list). Returns [B, n] standard normals, fully on device."""
+    batch_size = seeds.shape[0]
+    n_pairs = (n + 1) // 2
+    total = n_pairs * 2
+    indices = torch.arange(total, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
+    h = _batched_murmur3_32(indices, seeds.view(-1, 1))
+    u = h.to(torch.float32) / 4294967296.0
+    u1 = torch.clamp(u[:, :n_pairs], min=1e-10)
+    u2 = u[:, n_pairs:]
+    z0 = torch.sqrt(-2.0 * torch.log(u1)) * torch.cos(2.0 * math.pi * u2)
+    z1 = torch.sqrt(-2.0 * torch.log(u1)) * torch.sin(2.0 * math.pi * u2)
+    return torch.cat([z0, z1], dim=1)[:, :n]
+
+
+def _step_seeds(
+    base_seeds: torch.Tensor, step: int, prev_k: torch.Tensor, salt: int
+) -> torch.Tensor:
+    """Per-step seed = on-GPU murmur3 mixing base (per nonce) with step + prev_k.
+
+    base_seeds [B] int64 (constant), prev_k [B] int64 (chained on device, NEVER
+    .item()'d). step is a host int (same for the whole batch) OR a [B] int64 tensor
+    (per-row step, so a whole nonce-batch can be chained in ONE call). Returns [B]
+    int64 fully on device, so the decode chain has no GPU->CPU sync. Avalanche from
+    murmur3 makes consecutive steps / prev_k values uncorrelated (same property the
+    SHA256 path gave). The per-row result is identical to calling this once per row."""
+    if torch.is_tensor(step):
+        step_term = step.to(torch.int64).view(-1) * _MIX_B + salt
+    else:
+        step_term = int(step) * _MIX_B + salt
+    key = ((prev_k.to(torch.int64).view(-1) & 0xFFFFFFFF) * _MIX_A
+           + step_term) & 0xFFFFFFFF
+    return _batched_murmur3_32(key.view(-1, 1), base_seeds.view(-1, 1)).view(-1)
+
+
+def decode_base_seeds(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-nonce base seed (constant for the whole request) -> [B] int64 on device.
+    Computed once; carries no per-step dependency, so the host SHA256 here is fine."""
+    seeds = [_seed_from_string(f"{block_hash}_{public_key}_nonce{n}") for n in nonces]
+    return torch.tensor(seeds, dtype=torch.int64, device=device)
+
+
+def generate_decode_inputs(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    prev_k: List[int],
+    step: int,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Generate deterministic decode-step embedding chained to the previous sphere_k.
+
+    The seed incorporates prev_k so each decode step is deterministically
+    linked to its predecessor.
+
+    Returns:
+        Tensor of shape [batch_size, 1, dim]
+    """
+    batch_size = len(nonces)
+    result = torch.empty(batch_size, 1, dim, device=device, dtype=dtype)
+    for i, (nonce, k) in enumerate(zip(nonces, prev_k)):
+        seed_str = f"{block_hash}_{public_key}_nonce{nonce}_decode{step}_k{k}"
+        seed = _seed_from_string(seed_str)
+        normal = _normal(seed, dim, device)
+        result[i, 0] = normal.to(dtype)
+    return result
+
+
+def generate_decode_inputs_gpu(
+    base_seeds: torch.Tensor,
+    prev_k: torch.Tensor,
+    step: int,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """GPU-native counterpart of generate_decode_inputs: next decode-step input
+    embedding chained to prev_k (tensor). Returns [B, 1, dim]."""
+    seeds = _step_seeds(base_seeds, step, prev_k, _SALT_DECODE_EMBED)
+    return _batched_normal_t(seeds, dim, device).to(dtype).unsqueeze(1)
+
+
+def random_pick_indices(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    dim: int,
+    k: int,
+    device: torch.device,
+    prev_point_ids: Optional[List[int]] = None,
+    step: int = 0,
+) -> torch.Tensor:
+    """Pick k dimensions per nonce deterministically (vectorized).
+
+    When prev_point_ids is provided the seed is mixed with the previous
+    sphere index so decode steps pick a different subset than prefill.
+    """
+    if k <= 0 or k > dim:
+        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
+
+    batch_size = len(nonces)
+
+    seeds = []
+    for i, nonce in enumerate(nonces):
+        if prev_point_ids is None:
+            seeds.append(_seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}"
+            ))
+        else:
+            seeds.append(_seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}_k_{prev_point_ids[i]}"
+            ))
+
+    all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
+    seed_tensor = torch.tensor(seeds, dtype=torch.int64, device=device).unsqueeze(1)
+    scores = _batched_murmur3_32(all_idx, seed_tensor)
+
+    _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False, dim=1)
+    return chosen.to(torch.int64)
+
+
+def random_pick_indices_gpu(
+    base_seeds: torch.Tensor,
+    prev_k: torch.Tensor,
+    step: int,
+    dim: int,
+    k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """GPU-native counterpart of random_pick_indices (decode): k dims per row,
+    seed chained to prev_k (tensor). Returns [B, k] int64."""
+    if k <= 0 or k > dim:
+        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
+    seeds = _step_seeds(base_seeds, step, prev_k, _SALT_DECODE_PICK)
+    all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(seeds.shape[0], -1)
+    scores = _batched_murmur3_32(all_idx, seeds.view(-1, 1))
+    _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False, dim=1)
+    return chosen.to(torch.int64)
+
+
+_ROUTE_WINDOW = 16
+
+
+def set_route_window(n: int) -> None:
+    """Push the MoE seeded-routing window from the broadcast engine config into the
+    module global, once per worker before graph capture. Logged so a per-worker
+    mismatch (a config value that didn't reach a worker) shows: grep "PoC route window"."""
+    global _ROUTE_WINDOW
+    _ROUTE_WINDOW = int(n)
+    logger.info("PoC route window = %d (--poc-route-window); CONSENSUS-AFFECTING, "
+                "must match on all nodes/workers.", _ROUTE_WINDOW)
+
+
+def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
+                   device: torch.device) -> torch.Tensor:
+    """THE seeded expert selection — single source of truth for seeded routing.
+
+    Draws top_k DISTINCT experts straight from ``seed`` ([B,1] int64) by a partial
+    Fisher-Yates shuffle: pure integer (no topk, no scores, no ties) -> identical on
+    any hardware / eager / graph, and robust for ANY n_experts. Returns [B,n_experts]
+    forced logits (chosen experts hold descending values, the rest a low floor); the
+    natural MoE top-k over these picks exactly the seeded experts + gate weights."""
+    b = seed.shape[0]
+    perm = torch.arange(n_experts, device=device, dtype=torch.int64).unsqueeze(0).repeat(b, 1)
+    for i in range(top_k):                                # k swaps -> k distinct experts in perm[:, :k]
+        j = i + _batched_murmur3_32(torch.full((b, 1), i, dtype=torch.int32, device=device),
+                                    seed) % (n_experts - i)          # [B,1] swap target in [i, n)
+        gi = perm[:, i:i + 1].clone()
+        perm[:, i:i + 1] = perm.gather(1, j)
+        perm.scatter_(1, j, gi)
+    logits = torch.full((b, n_experts), -1.0e4, device=device, dtype=torch.float32)
+    logits.scatter_(1, perm[:, :top_k],
+                    torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).unsqueeze(0).expand(b, -1))
+    return logits
+
+
+# Grouped top-k forcing (DeepSeek family; Kimi shares the architecture).
+# CONSENSUS constants and formula — phase-0 spec, approved 15.08.2026:
+# stage G picks topk_group groups, stage E picks top_k experts INSIDE the
+# picked groups with a coverage guarantee (>=1 expert per picked group —
+# an empty picked group would tie at the -1e4 floor with losing groups and
+# make the engine's group selection nondeterministic).
+_SALT_ROUTE_GROUP = 0x3A
+_SALT_ROUTE_EXPERT = 0x5C
+
+
+def _forced_logits_grouped(seed: torch.Tensor, n_experts: int, top_k: int,
+                           n_group: int, topk_group: int,
+                           device: torch.device) -> torch.Tensor:
+    """Seeded expert selection compatible with grouped top-k routers.
+
+    Plain _forced_logits spreads the picks over ALL experts; a grouped router
+    first keeps only ``topk_group`` groups, so off-group picks could never be
+    selected and the -1e4 ties would leave the outcome to kernel order. Two
+    seeded stages fix that:
+
+      G: partial Fisher-Yates over ``n_group`` from seed_g -> picked groups;
+      E: one guaranteed expert per picked group (coverage), then the
+         remaining ``top_k - topk_group`` picks over the rest of the picked
+         groups' experts, all from seed_e.
+
+    seed_g/seed_e derive from the (base ^ step) seed with dedicated salts, so
+    neither stage correlates with the other or with the flat formula. Forced
+    values are ``top_k..1`` on chosen experts and -1e4 elsewhere: gaps are
+    orders of magnitude beyond |e_score_correction_bias|, so the bias can
+    shift scores but never the selected set; expert WEIGHTS derive from these
+    constants (deterministic), and intra-top-k order does not affect the
+    weighted sum. Integer-only selection — bit-identical on any hardware,
+    eager or graph.
+    """
+    b = seed.shape[0]
+    group_size = n_experts // n_group
+    if n_group * group_size != n_experts:
+        raise ValueError(
+            f"grouped forcing: n_experts {n_experts} not divisible by "
+            f"n_group {n_group}")
+    if top_k < topk_group:
+        raise ValueError(
+            f"grouped forcing: top_k {top_k} < topk_group {topk_group} — "
+            f"coverage guarantee impossible; needs a protocol decision")
+    seed_g = _batched_murmur3_32(
+        torch.full((b, 1), _SALT_ROUTE_GROUP, dtype=torch.int32, device=device),
+        seed)
+    seed_e = _batched_murmur3_32(
+        torch.full((b, 1), _SALT_ROUTE_EXPERT, dtype=torch.int32, device=device),
+        seed)
+
+    # -- stage G: pick topk_group distinct groups (partial Fisher-Yates) ----
+    gperm = torch.arange(n_group, device=device, dtype=torch.int64
+                         ).unsqueeze(0).repeat(b, 1)
+    for i in range(topk_group):
+        j = i + _batched_murmur3_32(
+            torch.full((b, 1), i, dtype=torch.int32, device=device),
+            seed_g) % (n_group - i)
+        gi = gperm[:, i:i + 1].clone()
+        gperm[:, i:i + 1] = gperm.gather(1, j)
+        gperm.scatter_(1, j, gi)
+    groups = gperm[:, :topk_group]                       # [B, topk_group]
+
+    # -- stage E over the picked groups' expert slots ------------------------
+    # Virtual layout: slot (g, r) = expert groups[g]*group_size + r. Coverage
+    # first: for picked group g (g < topk_group) pick one in-group offset;
+    # then the remaining top_k - topk_group picks run a partial Fisher-Yates
+    # over the remaining topk_group*(group_size-1) virtual slots.
+    off = _batched_murmur3_32(
+        torch.arange(topk_group, dtype=torch.int32, device=device
+                     ).unsqueeze(0).repeat(b, 1),
+        seed_e) % group_size                              # [B, topk_group]
+    cover = groups * group_size + off                     # [B, topk_group]
+
+    rest = top_k - topk_group
+    picks = [cover]
+    if rest > 0:
+        # Remaining slots per picked group: group_size-1 offsets, skipping
+        # the covered one. Virtual index v in [0, topk_group*(group_size-1)):
+        #   g = v // (group_size-1); r0 = v % (group_size-1)
+        #   r  = r0 + (r0 >= off[g])           (skip the covered offset)
+        m = topk_group * (group_size - 1)
+        vperm = torch.arange(m, device=device, dtype=torch.int64
+                             ).unsqueeze(0).repeat(b, 1)
+        for i in range(rest):
+            j = i + _batched_murmur3_32(
+                torch.full((b, 1), 0x100 + i, dtype=torch.int32, device=device),
+                seed_e) % (m - i)
+            vi = vperm[:, i:i + 1].clone()
+            vperm[:, i:i + 1] = vperm.gather(1, j)
+            vperm.scatter_(1, j, vi)
+        v = vperm[:, :rest]                               # [B, rest]
+        g = v // (group_size - 1)
+        r0 = v % (group_size - 1)
+        goff = off.gather(1, g)
+        r = r0 + (r0 >= goff).to(torch.int64)
+        picks.append(groups.gather(1, g) * group_size + r)
+    chosen = torch.cat(picks, dim=1)                      # [B, top_k]
+
+    logits = torch.full((b, n_experts), -1.0e4, device=device,
+                        dtype=torch.float32)
+    logits.scatter_(1, chosen,
+                    torch.arange(top_k, 0, -1, device=device,
+                                 dtype=torch.float32).unsqueeze(0).expand(b, -1))
+    return logits
+
+
+def _forced_logits_windowed(seed: torch.Tensor, steps: torch.Tensor, n_experts: int,
+                            top_k: int, window: int, device: torch.device) -> torch.Tensor:
+    """Seeded expert selection restricted to a step-rotating WINDOW of ``window`` experts.
+
+    The window offset depends on the decode STEP (shared across the batch, NOT per-nonce),
+    so a decode batch activates only ~window distinct experts per step -> the MoE grouped
+    GEMM batches them (measured ~7x faster than the full-scatter pick). The offset slides by
+    ``stride`` each step so over the trajectory the window sweeps every expert (coverage /
+    fraud-bound preserved). Each token still seed-picks top_k WITHIN the window (trajectories
+    stay distinct). Pure integer -> eager==graph, bit-identical cross-HW. seed/steps [B,1]."""
+    b = seed.shape[0]
+    W = max(window, top_k)
+    stride = max(1, n_experts // 256)                    # sweep ~all experts over a 256-step trajectory
+    offset = (steps * stride) % n_experts                # [B,1] window start (batch-shared at a given step)
+    perm = torch.arange(W, device=device, dtype=torch.int64).unsqueeze(0).repeat(b, 1)
+    for i in range(top_k):                               # partial Fisher-Yates over [0, W)
+        j = i + _batched_murmur3_32(torch.full((b, 1), i, dtype=torch.int32, device=device),
+                                    seed) % (W - i)
+        gi = perm[:, i:i + 1].clone()
+        perm[:, i:i + 1] = perm.gather(1, j)
+        perm.scatter_(1, j, gi)
+    chosen = (offset + perm[:, :top_k]) % n_experts      # window-local -> global expert ids (distinct)
+    logits = torch.full((b, n_experts), -1.0e4, device=device, dtype=torch.float32)
+    logits.scatter_(1, chosen,
+                    torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).unsqueeze(0).expand(b, -1))
+    return logits
+
+
+def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
+    """STABLE part of the routing seed: (block_hash, nonce, layer) — everything except
+    the decode step. sha256'd ONCE per (block_hash,nonce,layer) and cached across all
+    decode steps; ``step`` is folded in on-GPU per step (see expert_logits_from_base).
+    This is the efficiency contract: NO per-step string hashing (the K-calc lesson)."""
+    return f"{block_hash}_n{nonce}_route_layer_{layer}"
+
+
+def expert_logits_from_base(base_ints: torch.Tensor, steps: torch.Tensor,
+                            n_experts: int, top_k: int,
+                            device: torch.device,
+                            n_group: int = 1,
+                            topk_group: int = 1) -> torch.Tensor:
+    """Per-row forced router logits: fold the decode ``step`` into the cached base seed
+    ON GPU, then the shared _forced_logits selection. ``base_ints``/``steps`` are [B]
+    int64; returns [B, n_experts]. All integer (bit-exact cross-HW), no host loop, no
+    device->host sync. Equivalent per (row, layer) to seeded_experts()."""
+    seed = _batched_murmur3_32(steps.view(-1, 1).to(torch.int32),
+                               base_ints.view(-1, 1))               # [B,1] = fold step into base
+    if n_group > 1:
+        # Grouped router (DeepSeek family): the two-stage formula; the flat
+        # window path below stays byte-identical for n_group <= 1 (MiniMax).
+        return _forced_logits_grouped(seed, n_experts, top_k, n_group,
+                                      topk_group, device)
+    if _ROUTE_WINDOW and _ROUTE_WINDOW < n_experts:
+        return _forced_logits_windowed(seed, steps.view(-1, 1), n_experts, top_k,
+                                       _ROUTE_WINDOW, device)
+    return _forced_logits(seed, n_experts, top_k, device)
+
+
+def seeded_expert_logits(seed_str: str, n_experts: int, top_k: int,
+                         device: torch.device) -> torch.Tensor:
+    """Single-row forced logits from a seed string (tests / offline validators).
+    Same selection as the live path — both go through the shared _forced_logits."""
+    seed = torch.tensor([[_seed_from_string(seed_str)]], dtype=torch.int64, device=device)
+    return _forced_logits(seed, n_experts, top_k, device)[0]
+
+
+def seeded_experts(block_hash: str, nonce: int, step: int, layer: int,
+                   n_experts: int, top_k: int, device: torch.device) -> torch.Tensor:
+    """Reference (single-row) seeded experts = the EXACT live derivation: cached
+    sha256 base (block_hash+nonce+layer) then on-GPU ``step`` fold. Returns the chosen
+    expert indices. For tests / offline validators (the live runner uses the batched,
+    cached expert_logits_from_base, which is identical per row)."""
+    base = torch.tensor([_seed_from_string(route_base_seed(block_hash, nonce, layer))],
+                        dtype=torch.int64, device=device)
+    steps = torch.tensor([step], dtype=torch.int64, device=device)
+    logits = expert_logits_from_base(base, steps, n_experts, top_k, device)[0]
+    return torch.topk(logits, top_k).indices

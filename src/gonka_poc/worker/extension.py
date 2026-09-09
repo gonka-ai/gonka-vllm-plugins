@@ -5,10 +5,10 @@ the compat shim).
 Activation:
     vllm serve <model> --worker-extension-cls gonka_poc.worker.PoCWorkerExtension
 
-How vLLM wires this in (v0.23.0, verified):
-    ``vllm/v1/worker/worker_base.py:261-287`` (WorkerWrapperBase.init_worker)
+How vLLM wires this in (verified on the 0.25.1 line):
+    ``vllm/v1/worker/worker_base.py:263-284`` (WorkerWrapperBase.init_worker)
     resolves the qualname, asserts no attribute collisions with the concrete
-    Worker, then does ``worker_class.__bases__ += (PoCWorkerExtension,)``.
+    Worker, then appends ``PoCWorkerExtension`` to ``worker_class.__bases__``.
     There is NO __init__ -- methods just become attributes on the live Worker.
 
 Inside any method on this class, ``self`` is the live GPU Worker. Available
@@ -21,10 +21,10 @@ attributes:
 
 Invocation (from the API server / async engine):
     await async_llm.collective_rpc(
-        "execute_poc_forward",
+        "execute_poc_decode",
         args=(),
         kwargs={"block_hash": ..., "public_key": ..., "nonces": [...],
-                "seq_len": int, "k_dim": int, "poc_stronger_rng": bool},
+                "seq_len": int, "max_tokens": int, "route_window": int, ...},
         timeout=POC_RPC_TIMEOUT_MS / 1000,
     )
 
@@ -44,16 +44,17 @@ CONTRACT WARNINGS:
 """
 from __future__ import annotations
 
+import logging
+
 from typing import Any, Dict, List, Optional
 
 # NOTE: keep imports light at module scope -- this file is imported in every
 # worker process during init_worker. Heavy imports (torch, gonka_poc.poc.*)
 # are deferred into method bodies.
 #
-# ``gonka_poc._compat`` is intentionally light (pure-Python dispatcher) so
-# it's safe to import at module scope; routing kv_caches access through the
-# shim keeps the documented private-API touchpoint policy honest.
-from gonka_poc._compat import current as _compat_current
+import logging
+
+logger = logging.getLogger(__name__)
 
 class PoCWorkerExtension:
     """Add-only methods reachable from ``collective_rpc``.
@@ -65,119 +66,53 @@ class PoCWorkerExtension:
     # PoC forward (the actual GPU work)
     # ------------------------------------------------------------------ #
 
-    def execute_poc_forward(
+    def execute_poc_decode(
         self,
-        *,
         block_hash: str,
         public_key: str,
-        nonces: List[int],
+        nonces,
         seq_len: int,
-        k_dim: int = 12,
-        poc_stronger_rng: bool = False,
-        borrowed_block_ids: Optional[List[int]] = None,
-        borrowed_stripe: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Execute one PoC forward pass on this worker rank.
-
-        Args:
-            block_hash, public_key: PoC scope tags fed into the seeded RNG.
-            nonces: list[int] of nonces to compute artifacts for; one batched
-                forward processes all of them.
-            seq_len: sequence length per nonce.
-            k_dim: artifact vector dimensionality (default 12).
-            poc_stronger_rng: if True, use murmur-concat RNG path; default
-                False (legacy seeded normal path).
-            borrowed_block_ids / borrowed_stripe: KV block lease from
-                ``gonka_poc_borrow_blocks`` (validation-without-abort path).
-                ``None`` = legacy in-place layout over blocks 0..N. Physical
-                block choice does not affect artifact values (address-only).
-
-        Returns:
-            ``{"artifacts": [{"nonce": int, "vector_b64": str}, ...],
-               "rank": int}``
-
-            On PP non-last ranks the underlying forward returns ``None``
-            (intermediate tensors were forwarded inter-rank); we mirror that
-            with an empty artifact list so the caller can aggregate uniformly.
-
-            Keep the payload msgpack-friendly. Do NOT return torch tensors.
+        max_tokens: int,
+        route_window: int = 256,
+        enforced_k_steps=None,
+        debug: bool = False,
+        va_steps: int = 0,
+        per_nonce_reflection: bool = False,
+        borrowed_block_ids=None,
+        borrowed_stripe=None,
+    ):
+        """Decode-PoC chunk (prefill + max_tokens chained steps) — the new
+        scheme's worker entry: every rank runs it, the TP driver returns
+        artifacts, other ranks return None and the API server aggregates.
         """
-        # Deferred imports: pulling gonka_poc.poc.* requires a configured
-        # vllm runtime (vllm.logger), which is only available inside the
-        # worker process.
-        from gonka_poc.poc.data import encode_vector
-        from gonka_poc.poc.poc_model_runner import (
-            DEFAULT_K_DIM,
-            execute_poc_forward as _execute_poc_forward,
-        )
-
-        if not nonces:
-            return {"artifacts": [], "rank": int(getattr(self, "rank", -1))}
-
-        # vllm_config.model_config.get_hidden_size() is the canonical
-        # accessor on all supported minors; an unmapped minor already
-        # hard-fails in gonka_poc._compat, so no fallback is needed.
+        from gonka_poc.poc.decode_runner import execute_poc_decode as _run
         hidden_size = int(self.vllm_config.model_config.get_hidden_size())
-
-        result = _execute_poc_forward(
-            self,  # the live Worker; matches the ``worker`` param in poc_model_runner
-            block_hash,
-            public_key,
-            list(nonces),
-            int(seq_len),
-            int(hidden_size),
-            k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
-            poc_stronger_rng=bool(poc_stronger_rng),
-            borrowed_block_ids=(
-                list(borrowed_block_ids)
-                if borrowed_block_ids is not None else None),
-            borrowed_stripe=(
-                int(borrowed_stripe)
-                if borrowed_stripe is not None else None),
-        )
-
-        rank = int(getattr(self, "rank", -1))
-
-        # PP non-last ranks return None from the underlying forward.
-        if result is None:
-            return {"artifacts": [], "rank": rank}
-
-        vectors = result.get("vectors")
-        result_nonces = result.get("nonces", [])
-
-        artifacts: List[Dict[str, Any]] = []
-        if vectors is not None and len(result_nonces) > 0:
-            for i, nonce in enumerate(result_nonces):
-                artifacts.append({
-                    "nonce": int(nonce),
-                    "vector_b64": encode_vector(vectors[i]),
-                })
-
-        return {"artifacts": artifacts, "rank": rank}
-
-    def execute_poc_borrow_compat(self) -> Dict[str, Any]:
-        """Report whether borrowed-lease validation is bit-safe on this rank.
-
-        Borrowing is only safe where the legacy KV-scratch embeds path can
-        NEVER fire: on scratch-capable configs (a KV tensor matching the
-        model dtype and contiguous — bf16-KV models) the fleet's artifacts
-        depend on the scratch's deterministic self-overwrite, and a fresh
-        buffer + leased blocks would change bits (ADR-0015, Decision 5).
-        Conservative: ignores the size criterion, so a config that would
-        only sometimes select scratch still reports scratch_capable=True.
-        """
         try:
-            kv_caches = _compat_current().get_kv_cache_pool(self.model_runner)
-            dtype = self.model_config.dtype
-        except Exception:
-            # No pool yet / unexpected shape: report NOT borrow-safe.
-            return {"scratch_capable": True,
-                    "rank": int(getattr(self, "rank", -1))}
-        scratch_capable = any(
-            kv.dtype == dtype and kv.is_contiguous() for kv in kv_caches)
-        return {"scratch_capable": bool(scratch_capable),
-                "rank": int(getattr(self, "rank", -1))}
-
+            return _run(
+                self,
+                block_hash=block_hash,
+                public_key=public_key,
+                nonces=list(nonces),
+                seq_len=int(seq_len),
+                max_tokens=int(max_tokens),
+                hidden_size=int(hidden_size),
+                route_window=int(route_window),
+                enforced_k_steps=(
+                    {int(k): list(v) for k, v in enforced_k_steps.items()}
+                    if enforced_k_steps else None),
+                debug=bool(debug),
+                va_steps=int(va_steps),
+                per_nonce_reflection=bool(per_nonce_reflection),
+                borrowed_block_ids=(
+                    list(borrowed_block_ids)
+                    if borrowed_block_ids is not None else None),
+                borrowed_stripe=(
+                    int(borrowed_stripe)
+                    if borrowed_stripe is not None else None),
+            )
+        except Exception:  # noqa: BLE001 — surface via RPC, never hang the rank
+            logger.exception("execute_poc_decode failed")
+            raise
 
 # Public alias used in the ``--worker-extension-cls`` CLI string.
 __all__ = ["PoCWorkerExtension"]

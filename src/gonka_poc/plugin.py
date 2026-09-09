@@ -59,6 +59,20 @@ def register() -> None:
     if _registered:
         return
 
+    # PoC-wrapped model classes: registered FIRST so the engine compiles the
+    # wrapped module (transforms inside the compiled graph — 0.20 bit path).
+    # ONE model-agnostic factory for every architecture (call agreement
+    # 2026-08-19): subclasses are built dynamically against whatever base
+    # classes this vLLM build ships; extra archs via POC_ARCHITECTURES env.
+    try:
+        from vllm import ModelRegistry
+        from gonka_poc.models.factory import build_poc_subclasses
+        for arch, sub in build_poc_subclasses():
+            ModelRegistry.register_model(arch, sub)
+            logger.info("gonka_poc: %s overridden with PoC-wrapped class", arch)
+    except Exception:  # pragma: no cover — non-vllm import contexts
+        logger.exception("gonka_poc: model registry override failed")
+
     # Expose a process-local flag so the gate-presence check in
     # ``gonka_poc.entrypoint.gating.PoCGatingMiddleware`` can detect "plugin
     # loaded but no gate attached" (operator likely ran plain ``vllm serve``

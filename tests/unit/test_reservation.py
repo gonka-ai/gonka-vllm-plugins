@@ -1,7 +1,7 @@
 """Unit tests for the PoC KV reservation layer (``gonka_poc.poc.reservation``).
 
 Uses a fake engine client exposing the surfaces the layer touches:
-``collective_rpc`` (the scratch-capability probe), ``engine_core.
+``collective_rpc`` (legacy surface, no longer probed), ``engine_core.
 call_utility_async`` (borrow/return), ``abort`` + ``output_processor``
 (escalation / legacy safety), ``reset_prefix_cache``. vllm must be
 importable (the compat dispatch resolves by installed version) but no
@@ -9,7 +9,7 @@ engine is started.
 
 Probe-first flow: the first ``poc_reservation`` per engine client runs
 ``poc_validation_available`` — a ``collective_rpc("execute_poc_borrow_
-compat")`` and, if no rank is scratch-capable, a zero-block borrow RPC —
+compat")`` gate died with the prefill scheme; the probe is now a zero-block borrow RPC —
 and caches the verdict for the client's lifetime.
 """
 from __future__ import annotations
@@ -48,9 +48,8 @@ class FakeCore:
 
 
 class FakeEngine:
-    def __init__(self, script, scratch_capable=False):
+    def __init__(self, script):
         self.engine_core = FakeCore(script)
-        self.scratch_capable = scratch_capable
         self.aborted = 0
         self.prefix_resets = 0
 
@@ -59,10 +58,6 @@ class FakeEngine:
         class _OP:
             request_states = {"req-1": object()}
         self.output_processor = _OP()
-
-    async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
-        assert method == "execute_poc_borrow_compat"
-        return [{"scratch_capable": self.scratch_capable, "rank": 0}]
 
     async def abort(self, request_id, **kwargs):
         self.aborted += 1
@@ -111,10 +106,11 @@ def test_probe_cached_across_reservations():
     assert len(probes) == 1  # second reservation reused the cached verdict
 
 
-def test_scratch_capable_config_disables_borrowing():
-    # bf16-KV style config: the fleet's bits depend on the KV-scratch path,
-    # so borrowing must be OFF and the legacy path abort-protected.
-    eng = FakeEngine([], scratch_capable=True)
+def test_probe_failure_disables_borrowing():
+    # The zero-block borrow probe raising means no borrow surface: validation
+    # degrades to the legacy abort path (lease is None).
+    eng = FakeEngine([])
+    eng.engine_core.probe_response = RuntimeError("borrow surface missing")
 
     async def go():
         async with reservation.poc_reservation(eng, 2, 32) as lease:
@@ -205,7 +201,8 @@ def test_return_retries_transient_failures():
 def test_failed_reset_is_not_reported_as_success(caplog):
     # reset_prefix_cache returning False must escalate to
     # reset_running_requests=True and, if still False, log an ERROR.
-    eng = FakeEngine([], scratch_capable=True)
+    eng = FakeEngine([])
+    eng.engine_core.probe_response = RuntimeError("borrow surface missing")
     reset_calls = []
 
     async def stubborn_reset(reset_running_requests=False):
@@ -254,5 +251,7 @@ def test_versions_reports_probe_result():
     assert on["poc_validation_inference"] is True
     assert "vllm_version" in on and "gonka_poc_version" in on
 
-    off = asyncio.run(go(FakeEngine([], scratch_capable=True)))
+    eng_off = FakeEngine([])
+    eng_off.engine_core.probe_response = RuntimeError("borrow surface missing")
+    off = asyncio.run(go(eng_off))
     assert off["poc_validation_inference"] is False

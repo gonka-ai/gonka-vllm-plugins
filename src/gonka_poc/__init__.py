@@ -10,7 +10,7 @@ vllm wheel (0.25.x). It provides three integration surfaces:
    of ``gonka-vllm-serve``, and installs the EngineCore KV borrow/return
    utility methods for leased-block validation (ADR-0015).
 2. ``--worker-extension-cls gonka_poc.worker.PoCWorkerExtension`` exposing
-   ``execute_poc_forward`` to vLLM's ``collective_rpc``.
+   ``execute_poc_decode`` to vLLM's ``collective_rpc``.
 3. ``gonka-vllm-serve`` console script that composes a FastAPI app on top of
    the stock vLLM OpenAI-compatible server, attaching the PoC API router and a
    503/abort gating middleware.
