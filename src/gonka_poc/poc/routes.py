@@ -755,7 +755,7 @@ async def get_versions(request: Request) -> dict:
     ``poc_validation_inference`` advertises that ``/generate`` validation
     runs on leased KV blocks concurrently with live inference (port of
     gonka-ai/vllm qd/combine-poc-and-inference). It reflects an actual
-    probe (borrow RPC reachable AND the config is not scratch-capable) —
+    probe (borrow RPC reachable AND every rank derives inputs scratch-free) —
     never a hardcoded literal.
     """
     from vllm import __version__ as vllm_version

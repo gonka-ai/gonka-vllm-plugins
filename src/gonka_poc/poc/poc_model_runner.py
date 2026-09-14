@@ -271,39 +271,6 @@ def _generate_poc_input_ids(block_hash, public_key, nonces, seq_len, worker, dev
         block_hash, public_key, nonces, seq_len, int(hf_cfg.vocab_size), device)
 
 
-def _select_poc_kv_scratch(
-    kv_caches: list,
-    dtype: torch.dtype,
-    needed_elems: int,
-    batch_size: int,
-    seq_len: int,
-    hidden_size: int,
-) -> Optional[torch.Tensor]:
-    """Return a no-copy scratch view into KV cache memory, if safe.
-
-    KV cache storage may use packed dtypes (e.g. ``uint8`` for FP8) or
-    backend-specific non-contiguous layouts. Only reuse memory that already
-    matches model embedding dtype and is contiguous so ``view(-1)`` does not
-    allocate a copy.
-
-    CONSENSUS-CRITICAL: on configs where this selects a tensor (bf16-KV
-    models) the fleet's artifacts depend on the resulting deterministic
-    layer-0 K/V-over-residual overwrite — the selection criteria must not
-    change (ADR-0015, Decision 5). Used ONLY on the lease-None path; the
-    borrow probe (``execute_poc_borrow_compat``) disables leasing wherever
-    this could select.
-    """
-    for kv in kv_caches:
-        if kv.dtype != dtype:
-            continue
-        if not kv.is_contiguous():
-            continue
-        if kv.numel() < needed_elems:
-            continue
-        return kv.view(-1)[:needed_elems].view(batch_size, seq_len, hidden_size)
-    return None
-
-
 @torch.inference_mode()
 def execute_poc_forward(
     worker,
@@ -391,53 +358,20 @@ def execute_poc_forward(
     inputs_embeds = None
 
     if pp_group.is_first_rank:
-        # CONSENSUS-CRITICAL fork in the embeds source (ADR-0015, Decision 5):
-        #
-        # * lease is None (mining + legacy validation): reproduce the DEPLOYED
-        #   derivation path exactly, INCLUDING the KV-scratch reuse. On configs where
-        #   the scratch is selected (KV dtype == model dtype, contiguous —
-        #   i.e. bf16-KV models), layer-0 K/V writes overlap the scratch view
-        #   that also backs the residual, and the fleet's artifacts already
-        #   depend on that deterministic self-overwrite. Removing it here
-        #   would change bits under every deployed validator.
-        # * lease present (borrowed validation): ALWAYS a fresh buffer. The
-        #   scratch would write outside the lease; borrowing is only enabled
-        #   on configs where the scratch is never selected (see
-        #   execute_poc_borrow_compat + the reservation-side probe), so the
-        #   fresh path is bit-identical to what those configs already run.
-        # NOTE: the deployed scratch path also fires with poc_stronger_rng=True
-        # and then fills with the LEGACY per-nonce RNG (a known quirk that
-        # diverges from the fresh path's concat-murmur). Agreement with the
-        # fleet requires reproducing the quirk, not fixing it: a node deriving
-        # inputs differently lands beyond the validation threshold on every
-        # nonce -- not noise the statistical test would absorb.
-        kv_scratch = None
-        if borrowed_block_ids is None:
-            compat = _compat_current()
-            try:
-                kv_caches = compat.get_kv_cache_pool(worker.model_runner)
-            except RuntimeError:
-                kv_caches = []
-            kv_scratch = _select_poc_kv_scratch(
-                kv_caches, dtype, batch_size * seq_len * hidden_size,
-                batch_size, seq_len, hidden_size,
-            )
-        if kv_scratch is not None:
-            from .gpu_random import _seed_from_string, _normal
-            for i, nonce in enumerate(nonces):
-                seed = _seed_from_string(
-                    f"{block_hash}_{public_key}_nonce{nonce}")
-                vals = _normal(seed, seq_len * hidden_size, device)
-                kv_scratch[i].copy_(vals.view(seq_len, hidden_size).to(dtype))
-                del vals
-            inputs_embeds = kv_scratch
-        else:
-            _gen_fn = generate_inputs_concat_murmur if poc_stronger_rng else generate_inputs
-            inputs_embeds = _gen_fn(
-                block_hash, public_key, nonces,
-                dim=hidden_size, seq_len=seq_len,
-                device=device, dtype=dtype,
-            )
+        # Inputs always live in a fresh buffer. The old path aliased them
+        # onto the head of a KV-cache tensor whenever one matched the model
+        # dtype and was contiguous (bf16-KV models on NHD layouts); layer-0
+        # K/V writes then overwrote the residual of the first
+        # ``batch * 2*kv_dim/hidden`` sequences, so an artifact depended on
+        # the batch it was computed in and no validator could reproduce it.
+        # Both paths fill from the same seeded RNG, so every sequence that
+        # was not overwritten derives bit-identically to before.
+        _gen_fn = generate_inputs_concat_murmur if poc_stronger_rng else generate_inputs
+        inputs_embeds = _gen_fn(
+            block_hash, public_key, nonces,
+            dim=hidden_size, seq_len=seq_len,
+            device=device, dtype=dtype,
+        )
     else:
         intermediate_tensors = IntermediateTensors(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())

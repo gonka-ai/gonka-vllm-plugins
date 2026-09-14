@@ -53,7 +53,6 @@ from typing import Any, Dict, List, Optional
 # ``gonka_poc._compat`` is intentionally light (pure-Python dispatcher) so
 # it's safe to import at module scope; routing kv_caches access through the
 # shim keeps the documented private-API touchpoint policy honest.
-from gonka_poc._compat import current as _compat_current
 
 class PoCWorkerExtension:
     """Add-only methods reachable from ``collective_rpc``.
@@ -158,24 +157,12 @@ class PoCWorkerExtension:
     def execute_poc_borrow_compat(self) -> Dict[str, Any]:
         """Report whether borrowed-lease validation is bit-safe on this rank.
 
-        Borrowing is only safe where the legacy KV-scratch embeds path can
-        NEVER fire: on scratch-capable configs (a KV tensor matching the
-        model dtype and contiguous — bf16-KV models) the fleet's artifacts
-        depend on the scratch's deterministic self-overwrite, and a fresh
-        buffer + leased blocks would change bits (ADR-0015, Decision 5).
-        Conservative: ignores the size criterion, so a config that would
-        only sometimes select scratch still reports scratch_capable=True.
+        Always ``scratch_capable=False``: PoC inputs are derived in a fresh
+        buffer on every path, so a leased forward derives exactly what the
+        in-place forward derives. Kept as an RPC so older API-server code
+        that probes it keeps working.
         """
-        try:
-            kv_caches = _compat_current().get_kv_cache_pool(self.model_runner)
-            dtype = self.model_config.dtype
-        except Exception:
-            # No pool yet / unexpected shape: report NOT borrow-safe.
-            return {"scratch_capable": True,
-                    "rank": int(getattr(self, "rank", -1))}
-        scratch_capable = any(
-            kv.dtype == dtype and kv.is_contiguous() for kv in kv_caches)
-        return {"scratch_capable": bool(scratch_capable),
+        return {"scratch_capable": False,
                 "rank": int(getattr(self, "rank", -1))}
 
 
