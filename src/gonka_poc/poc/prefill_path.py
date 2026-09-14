@@ -38,7 +38,7 @@ async def execute_poc_forward_rpc(
     ``lease`` is a KV block lease from :func:`poc_reservation`
     (``{"block_ids": [...], "blocks_per_seq": int}``) — when present the
     forward writes ONLY leased blocks and live inference stays intact;
-    ``None`` selects the legacy in-place layout (blocks 0..N — callers must
+    ``None`` selects the legacy in-place layout (blocks 1..N — callers must
     have aborted inference first).
 
     Uses ``EngineClient.collective_rpc`` (vllm/engine/protocol.py) to invoke
@@ -59,7 +59,7 @@ async def execute_poc_forward_rpc(
         return {"artifacts": []}
 
     if lease is None:
-        # In-place layout writes blocks 0..N unconditionally, and nothing
+        # In-place layout writes blocks 1..N unconditionally, and nothing
         # gates new admissions on the validation path — re-drain in-flight
         # inference before EVERY legacy chunk (upstream donor behaviour;
         # requests admitted between chunks would otherwise be silently
