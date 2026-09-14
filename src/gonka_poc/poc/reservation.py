@@ -17,7 +17,7 @@ Safety contract:
     * Legacy fallback (no lease obtainable): inference is ABORTED first —
       restoring the abort-before-overwrite invariant that the plugin's
       ``/generate`` path silently lacked — and the prefix cache is reset
-      on exit, because blocks ``0..N`` were overwritten without hash
+      on exit, because blocks ``1..N`` were overwritten without hash
       invalidation (a prefix hit would otherwise serve poisoned KV).
 
 Concurrency: the FIFO ``asyncio.Lock`` serializes validations in this
@@ -145,7 +145,7 @@ async def reserve_poc_blocks(
     Order: (1) poll-borrow within ``timeout_ms``; (2) on failure abort all
     in-flight inference — this is BOTH the escalation (freed blocks make the
     re-borrow succeed) AND the safety precondition for the legacy fallback
-    (which overwrites blocks ``0..N`` in place); (3) re-poll unless the RPC
+    (which overwrites blocks ``1..N`` in place); (3) re-poll unless the RPC
     surface itself is broken. Returns the lease dict or ``None`` — by the
     time ``None`` is returned, inference has been aborted, so the caller may
     safely run the legacy in-place path.
@@ -236,7 +236,7 @@ async def _return_lease_with_retry(engine_client: Any, lease: dict) -> None:
 
 
 async def reset_prefix_cache_after_inplace_poc(engine_client: Any) -> None:
-    """Drop the prefix cache after an in-place (blocks ``0..N``) PoC round.
+    """Drop the prefix cache after an in-place (blocks ``1..N``) PoC round.
 
     The legacy path overwrites cached blocks WITHOUT evicting their hashes
     (``free_blocks`` keeps ``block_hash`` for reuse), so a later prefix hit

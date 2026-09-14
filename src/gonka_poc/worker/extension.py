@@ -89,7 +89,7 @@ class PoCWorkerExtension:
                 False (legacy seeded normal path).
             borrowed_block_ids / borrowed_stripe: KV block lease from
                 ``gonka_poc_borrow_blocks`` (validation-without-abort path).
-                ``None`` = legacy in-place layout over blocks 0..N. Physical
+                ``None`` = legacy in-place layout over blocks 1..N. Physical
                 block choice does not affect artifact values (address-only).
 
         Returns:

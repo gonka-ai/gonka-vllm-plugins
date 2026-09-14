@@ -146,20 +146,28 @@ def _borrowed_layout(
 
 
 def _inplace_layout(batch_size, seq_len, g_block, device):
-    """Legacy in-place slot_mapping + block_table over blocks ``0..N``.
+    """Legacy in-place slot_mapping + block_table over blocks ``1..N``.
 
-    slot = (seq_idx*blocks_per_seq + t//g_block)*g_block + t%g_block
-         = seq_idx*padded_len + t   (contiguous per sequence, padded to
-    a block multiple), so the mapping vectorizes to two aranges.
+    Block 0 is never used: it is vLLM's null block (``BlockPool.null_block``,
+    ``NULL_BLOCK_ID == 0``), the placeholder the engine hands out as padding
+    and expects to stay all-zero. Mamba-style state kernels go further and
+    treat state index 0 as "padding, skip this sequence" (``causal_conv1d``
+    returns without computing it), so a sequence placed on block 0 comes out
+    of every linear-attention layer with whatever the output buffer held.
+
+    slot = (1 + seq_idx*blocks_per_seq + t//g_block)*g_block + t%g_block
+         = g_block + seq_idx*padded_len + t   (contiguous per sequence,
+    padded to a block multiple), so the mapping still vectorizes to two
+    aranges plus a constant offset.
     """
     blocks_per_seq = math.ceil(seq_len / g_block)
     padded = blocks_per_seq * g_block
     base = (torch.arange(batch_size, dtype=torch.long, device=device)
-            * padded).repeat_interleave(seq_len)
+            * padded + g_block).repeat_interleave(seq_len)
     slot_mapping = base + torch.arange(
         seq_len, dtype=torch.long, device=device).repeat(batch_size)
     block_table = torch.arange(
-        batch_size * blocks_per_seq, dtype=torch.int32, device=device
+        1, batch_size * blocks_per_seq + 1, dtype=torch.int32, device=device
     ).view(batch_size, blocks_per_seq)
     return slot_mapping, block_table
 
@@ -180,7 +188,10 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
 
     Two block sources:
       * ``borrowed_block_ids is None`` — legacy in-place layout over blocks
-        ``0..N`` (mining and the abort-based fallback). BIT-PATH UNCHANGED.
+        ``1..N`` (mining and the abort-based fallback). Block ids only enter
+        the address translation, so this is bit-identical to the old
+        ``0..N`` layout for every sequence except the one that used to sit on
+        the null block — see :func:`_inplace_layout`.
       * lease (``borrowed_block_ids`` + ``borrowed_stripe`` from
         ``gonka_poc_borrow_blocks``) — validation runs on pool blocks that
         are provably disjoint from live inference; see
