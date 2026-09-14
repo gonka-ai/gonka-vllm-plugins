@@ -55,7 +55,7 @@ async def _execute_poc_forward_rpc(
     ``lease`` is a KV block lease from :func:`poc_reservation`
     (``{"block_ids": [...], "blocks_per_seq": int}``) — when present the
     forward writes ONLY leased blocks and live inference stays intact;
-    ``None`` selects the legacy in-place layout (blocks 0..N — callers must
+    ``None`` selects the legacy in-place layout (blocks 1..N — callers must
     have aborted inference first).
 
     Uses ``EngineClient.collective_rpc`` (vllm/engine/protocol.py) to invoke
@@ -76,7 +76,7 @@ async def _execute_poc_forward_rpc(
         return {"artifacts": []}
 
     if lease is None:
-        # In-place layout writes blocks 0..N unconditionally, and nothing
+        # In-place layout writes blocks 1..N unconditionally, and nothing
         # gates new admissions on the validation path — re-drain in-flight
         # inference before EVERY legacy chunk (upstream donor behaviour;
         # requests admitted between chunks would otherwise be silently
@@ -447,7 +447,7 @@ async def _generation_loop(
         logger.error(f"PoC generation crashed: {e}", exc_info=True)
         raise
     finally:
-        # Mining wrote blocks 0..N in place without evicting their cached
+        # Mining wrote blocks 1..N in place without evicting their cached
         # hashes — drop the prefix cache so later hits cannot serve
         # PoC-clobbered KV (best-effort; see reservation module docstring).
         await reset_prefix_cache_after_inplace_poc(engine_client)
@@ -755,7 +755,7 @@ async def get_versions(request: Request) -> dict:
     ``poc_validation_inference`` advertises that ``/generate`` validation
     runs on leased KV blocks concurrently with live inference (port of
     gonka-ai/vllm qd/combine-poc-and-inference). It reflects an actual
-    probe (borrow RPC reachable AND the config is not scratch-capable) —
+    probe (borrow RPC reachable AND every rank derives inputs scratch-free) —
     never a hardcoded literal.
     """
     from vllm import __version__ as vllm_version

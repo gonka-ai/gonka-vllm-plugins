@@ -29,7 +29,7 @@ def _naive_layout(batch_size: int, seq_len: int, g_block: int) -> torch.Tensor:
     blocks_per_seq = math.ceil(seq_len / g_block)
     slots = []
     for seq_idx in range(batch_size):
-        base_block = seq_idx * blocks_per_seq
+        base_block = 1 + seq_idx * blocks_per_seq  # block 0 is the null block
         for t in range(seq_len):
             b = base_block + t // g_block
             slots.append(b * g_block + t % g_block)
@@ -84,13 +84,14 @@ def test_per_group_block_tables_differ():
     comp_bt = _block_table(16, 256, 8)
     assert main_bt.shape == (16, 1)
     assert comp_bt.shape == (16, 32)
-    # Padded extents equal here (256 | 256), so slot ids coincide...
+    # Padded extents equal here (256 | 256), so slot ids coincide up to the
+    # per-group skip of block 0 (one block of that group's size)...
     assert torch.equal(
-        _vectorized_layout(16, 256, 256), _vectorized_layout(16, 256, 8))
+        _vectorized_layout(16, 256, 256) - 256, _vectorized_layout(16, 256, 8) - 8)
     # ...but diverge as soon as the padded extents differ
     # (seq_len=260: ceil/8*8 = 264 vs ceil/256*256 = 512):
     assert not torch.equal(
-        _vectorized_layout(2, 260, 8), _vectorized_layout(2, 260, 256))
+        _vectorized_layout(2, 260, 8) - 8, _vectorized_layout(2, 260, 256) - 256)
 
 
 # --------------------------------------------------------------------------- #

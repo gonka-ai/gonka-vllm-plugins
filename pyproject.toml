@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gonka-poc"
-version = "0.1.4"
+version = "0.1.5"
 description = "Out-of-tree vLLM plugin for Gonka Proof-of-Compute v2 (vllm 0.25.x / 0.28.x)."
 readme = "README.md"
 requires-python = ">=3.10"
