@@ -46,17 +46,14 @@ from the BlockPool so validation and inference coexist; mining
    `reset_running_requests=True` and then logs an ERROR (a plain reset
    silently refuses while any block is held).
 5. **KV-scratch embeds reuse is KEPT on the lease-None path, unchanged**
-   — including its `poc_stronger_rng` skew. On scratch-capable configs
-   (KV dtype == model dtype, contiguous — bf16-KV models) the fleet
-   derives inputs through the scratch's deterministic layer-0
-   K/V-over-residual overwrite; a different derivation lands beyond the
-   validation threshold on every nonce (not noise the statistical test
-   absorbs), so an honest node would fail under every deployed validator. The borrowed path always uses a fresh buffer
-   and is therefore **only enabled where the scratch can never fire**:
-   the worker probe `execute_poc_borrow_compat` reports
-   `scratch_capable`, and `poc_validation_available` disables borrowing
-   on such configs (fp8/packed-KV models — GLM, DeepSeek-V4 — are
-   scratch-free and derive identically on both paths).
+   — *superseded 2026-09-14, see the decision log.* The scratch aliased
+   the PoC inputs onto the head of a KV-cache tensor, and layer-0 K/V
+   writes overwrote the residual of the first `batch * 2*kv_dim/hidden`
+   sequences of every batch, so those artifacts depended on the batch
+   they were computed in and no validator could reproduce them. Inputs
+   now always come from a fresh buffer filled by the same seeded RNG;
+   every sequence that was not overwritten derives bit-identically, and
+   the borrowed path is enabled on every configuration.
 6. **Feature detection:** `GET /api/v1/pow/versions` reports
    `poc_validation_inference` from an actual probe (worker
    scratch-capability + a zero-block borrow round-trip), never a literal.
