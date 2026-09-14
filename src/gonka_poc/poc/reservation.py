@@ -61,11 +61,10 @@ async def poc_validation_available(engine_client: Any) -> bool:
     """Probe (once per engine client) whether borrowed-lease validation is on.
 
     Three gates, all required:
-      * every worker rank reports ``scratch_capable=False`` — on
-        scratch-capable (bf16-KV) configs the fleet's artifacts depend on
-        the legacy KV-scratch derivation path, and a leased forward would
-        derive different vectors -- beyond the validation tolerance, not
-        within it (ADR-0015, Decision 5);
+      * every worker rank reports ``scratch_capable=False`` (always true
+        now that PoC inputs live in a fresh buffer on every path; the RPC
+        stays so an older worker that still selects the KV scratch is
+        refused);
       * the borrow RPC surface answers (a zero-block borrow returns None
         without raising — proves the injected EngineCore methods and the
         utility transport);
