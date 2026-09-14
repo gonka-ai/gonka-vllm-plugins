@@ -49,6 +49,10 @@ POC_BORROW_TIMEOUT_MS = int(os.getenv("POC_BORROW_TIMEOUT_MS", "3000"))
 _BORROW_POLL_SEC = 0.05
 _ABORT_SETTLE_SEC = 0.05
 
+# Models whose KV-cache groups make a validation lease unobtainable or
+# unsafe; see poc_validation_available.
+_NO_LEASE_MODEL_TYPES = frozenset({"glm5_next"})
+
 # FIFO per-process lock — see module docstring.
 _poc_reservation_lock = asyncio.Lock()
 
@@ -82,6 +86,23 @@ async def poc_validation_available(engine_client: Any) -> bool:
         return cached
     compat = _compat_current()
     available = False
+    model_type = getattr(getattr(getattr(getattr(
+        engine_client, "vllm_config", None), "model_config", None),
+        "hf_config", None), "model_type", None)
+    if model_type in _NO_LEASE_MODEL_TYPES:
+        # GLM-5.3-Flash: the sparse-MLA indexer tail group has a 4-token
+        # block, so a validation lease needs 256 pool blocks per nonce and
+        # never fits at the fleet's batch sizes; where it does fit (batch
+        # <= ~11) the borrowed layout for that group faults the engine
+        # (XID 31). Stay on the abort-based legacy path and say so.
+        logger.info(
+            "PoC borrowed-lease validation disabled for model_type=%s",
+            model_type)
+        try:
+            _borrow_available[engine_client] = False
+        except TypeError:
+            pass
+        return False
     try:
         ranks = await engine_client.collective_rpc(
             "execute_poc_borrow_compat", timeout=30)
