@@ -17,7 +17,7 @@ Safety contract:
     * Legacy fallback (no lease obtainable): inference is ABORTED first —
       restoring the abort-before-overwrite invariant that the plugin's
       ``/generate`` path silently lacked — and the prefix cache is reset
-      on exit, because blocks ``0..N`` were overwritten without hash
+      on exit, because blocks ``1..N`` were overwritten without hash
       invalidation (a prefix hit would otherwise serve poisoned KV).
 
 Concurrency: the FIFO ``asyncio.Lock`` serializes validations in this
@@ -49,6 +49,10 @@ POC_BORROW_TIMEOUT_MS = int(os.getenv("POC_BORROW_TIMEOUT_MS", "3000"))
 _BORROW_POLL_SEC = 0.05
 _ABORT_SETTLE_SEC = 0.05
 
+# Models whose KV-cache groups make a validation lease unobtainable or
+# unsafe; see poc_validation_available.
+_NO_LEASE_MODEL_TYPES = frozenset({"glm5_next"})
+
 # FIFO per-process lock — see module docstring.
 _poc_reservation_lock = asyncio.Lock()
 
@@ -61,11 +65,10 @@ async def poc_validation_available(engine_client: Any) -> bool:
     """Probe (once per engine client) whether borrowed-lease validation is on.
 
     Three gates, all required:
-      * every worker rank reports ``scratch_capable=False`` — on
-        scratch-capable (bf16-KV) configs the fleet's artifacts depend on
-        the legacy KV-scratch derivation path, and a leased forward would
-        derive different vectors -- beyond the validation tolerance, not
-        within it (ADR-0015, Decision 5);
+      * every worker rank reports ``scratch_capable=False`` (always true
+        now that PoC inputs live in a fresh buffer on every path; the RPC
+        stays so an older worker that still selects the KV scratch is
+        refused);
       * the borrow RPC surface answers (a zero-block borrow returns None
         without raising — proves the injected EngineCore methods and the
         utility transport);
@@ -83,6 +86,23 @@ async def poc_validation_available(engine_client: Any) -> bool:
         return cached
     compat = _compat_current()
     available = False
+    model_type = getattr(getattr(getattr(getattr(
+        engine_client, "vllm_config", None), "model_config", None),
+        "hf_config", None), "model_type", None)
+    if model_type in _NO_LEASE_MODEL_TYPES:
+        # GLM-5.3-Flash: the sparse-MLA indexer tail group has a 4-token
+        # block, so a validation lease needs 256 pool blocks per nonce and
+        # never fits at the fleet's batch sizes; where it does fit (batch
+        # <= ~11) the borrowed layout for that group faults the engine
+        # (XID 31). Stay on the abort-based legacy path and say so.
+        logger.info(
+            "PoC borrowed-lease validation disabled for model_type=%s",
+            model_type)
+        try:
+            _borrow_available[engine_client] = False
+        except TypeError:
+            pass
+        return False
     try:
         ranks = await engine_client.collective_rpc(
             "execute_poc_borrow_compat", timeout=30)
@@ -145,7 +165,7 @@ async def reserve_poc_blocks(
     Order: (1) poll-borrow within ``timeout_ms``; (2) on failure abort all
     in-flight inference — this is BOTH the escalation (freed blocks make the
     re-borrow succeed) AND the safety precondition for the legacy fallback
-    (which overwrites blocks ``0..N`` in place); (3) re-poll unless the RPC
+    (which overwrites blocks ``1..N`` in place); (3) re-poll unless the RPC
     surface itself is broken. Returns the lease dict or ``None`` — by the
     time ``None`` is returned, inference has been aborted, so the caller may
     safely run the legacy in-place path.
@@ -236,7 +256,7 @@ async def _return_lease_with_retry(engine_client: Any, lease: dict) -> None:
 
 
 async def reset_prefix_cache_after_inplace_poc(engine_client: Any) -> None:
-    """Drop the prefix cache after an in-place (blocks ``0..N``) PoC round.
+    """Drop the prefix cache after an in-place (blocks ``1..N``) PoC round.
 
     The legacy path overwrites cached blocks WITHOUT evicting their hashes
     (``free_blocks`` keeps ``block_hash`` for reuse), so a later prefix hit

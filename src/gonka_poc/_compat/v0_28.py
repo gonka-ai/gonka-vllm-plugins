@@ -228,7 +228,7 @@ def get_kv_cache_pool(model_runner: Any) -> list:
     Contract test:
         tests/contract/test_api_surface.py::test_kv_caches_attribute
 
-    The PoC forward reuses blocks starting at index 0 as scratch space; the
+    The PoC forward reuses blocks starting at index 1 as scratch space; the
     99a372d4e fork commit ("safer kv cache reuse") added dtype/contiguity
     checks. That logic lives in gonka_poc.poc.poc_model_runner; this helper
     is just the access point.

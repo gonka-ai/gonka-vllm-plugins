@@ -483,7 +483,7 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     # A mining round owns the node, whichever scheme: live inference is gated
     # off (503) and drained first, as in 0.1.3 (ADR-0013 ordering: activate ->
     # abort -> spawn), and /stop or the round's end re-opens it. The prefill
-    # scheme needs this for correctness (its forward writes KV blocks 0..N in
+    # scheme needs this for correctness (its forward writes KV blocks 1..N in
     # place); the decode scheme could share the scheduler with chat, but a
     # round next to live chat starves both sides, and the chain's UX is
     # "PoC runs, inference pauses, artifacts get published".
@@ -656,7 +656,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
 
     # One lease per request, reused across chunks; lease=None => inference has
     # already been aborted and the forward falls back to the legacy in-place
-    # layout over blocks 0..N -- see poc_reservation. Decode is deliberately
+    # layout over blocks 1..N -- see poc_reservation. Decode is deliberately
     # left outside: it shares the scheduler with live chat by design.
     async with contextlib.AsyncExitStack() as _stack:
         lease = None if poc_decode else await _stack.enter_async_context(
