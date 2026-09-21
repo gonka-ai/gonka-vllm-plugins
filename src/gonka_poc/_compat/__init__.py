@@ -64,6 +64,7 @@ def _detect_vllm_version() -> Tuple[int, ...]:
 # Map of (major, minor) -> module name within this package.
 _DISPATCH: Mapping[Tuple[int, int], str] = {
     (0, 25): "gonka_poc._compat.v0_25",
+    (0, 28): "gonka_poc._compat.v0_28",
 }
 
 
