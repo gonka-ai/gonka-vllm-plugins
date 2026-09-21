@@ -194,6 +194,28 @@ async def _run_server(args: Any) -> None:
     sock.close()
 
 
+def _serve_fallback(argv: list[str] | None) -> int:
+    """Bases where the OpenAI app is built by ``vllm serve`` (no
+    ``vllm.entrypoints.openai.cli_args``): translate the MLNode launch line
+    ``-m gonka_poc.entrypoint.api_router --model M ...`` into ``vllm serve M ...``.
+    The residual's ``launchers/app.py`` registers the PoC routes and the gate."""
+    import sys
+    args = list(sys.argv[1:] if argv is None else argv)
+    model, rest, i = None, [], 0
+    while i < len(args):
+        if args[i] == "--model" and i + 1 < len(args):
+            model = args[i + 1]; i += 2; continue
+        if args[i].startswith("--model="):
+            model = args[i].split("=", 1)[1]; i += 1; continue
+        rest.append(args[i]); i += 1
+    if model is None:
+        raise SystemExit("gonka-vllm-serve: --model is required")
+    from vllm.entrypoints.cli.main import main as cli_main
+    logger.info("gonka-vllm-serve: legacy api_server layout absent, delegating to `vllm serve %s`", model)
+    sys.argv = ["vllm", "serve", model, *rest]
+    return cli_main() or 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """``gonka-vllm-serve`` entry point.
 
@@ -201,10 +223,13 @@ def main(argv: list[str] | None = None) -> int:
     :func:`_run_server` so we own the composition step.
     """
     # Deferred to avoid pulling vllm at --help time on a system without it.
-    from vllm.entrypoints.openai.cli_args import (
-        make_arg_parser,
-        validate_parsed_serve_args,
-    )
+    try:
+        from vllm.entrypoints.openai.cli_args import (
+            make_arg_parser,
+            validate_parsed_serve_args,
+        )
+    except ModuleNotFoundError:
+        return _serve_fallback(argv)
     # ``FlexibleArgumentParser`` moved out of the flat ``vllm/utils.py`` module
     # into ``vllm.utils.argparse_utils`` in v0.22.0+ and is NOT re-exported from
     # the ``vllm.utils`` package ``__init__.py``. Try the canonical location
