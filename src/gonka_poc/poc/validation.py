@@ -156,23 +156,33 @@ def run_validation(
     k_dim: int = 12,
     use_trajectory: bool = False,
     ref_vectors: Optional[Dict[int, List[str]]] = None,
+    requested_nonces: Optional[List[int]] = None,
 ) -> Dict:
     """Run full validation with fraud test. Same response shape for both flows.
 
     - prefill (use_trajectory=False): vector-L2 per nonce + binomial fraud_test
       (uses p_mismatch + fraud_threshold). Unchanged.
     - decode (use_trajectory=True, max_tokens>0): a nonce mismatches when the
-      validator disagreed with the reference on some step with a snap margin
-      above dist_threshold (tau); then the same binomial fraud_test over nonces.
+      validator disagreed with the reference on some step with a claimed-cell
+      margin above dist_threshold (tau); then the same binomial fraud_test over nonces.
+    - requested_nonces (optional): nonces without an artifact (the runner drops a
+      non-finite one) leave the sample: ``excluded_nonces``, n_total = scored count.
     - ref_vectors (optional, decode): prover-side sph_values_steps per nonce.
       When both sides carry pre-snap slices, the continuous vector-channel score
       (score_vector_channel) is attached as ``vector_score`` EVIDENCE — the
       verdict stays k-based so the two channels can be A/B'd on the same run.
     """
     per_nonce: List[Dict] = []   # per-nonce evidence
+    excluded: List[int] = []
+    if requested_nonces is not None:
+        have = {a["nonce"] for a in computed_artifacts}
+        excluded = [n for n in requested_nonces if n not in have]
+        n_total = len(computed_artifacts)
+        if not n_total:
+            raise ValueError("no nonce produced an artifact")
     if use_trajectory:
         # One nonce is one trial, exactly as in the prefill flow. The nonce's
-        # distance is the largest snap margin among the steps where the
+        # distance is the largest claimed margin (sphere.claimed_margin) among the steps where the
         # validator disagreed with the reference (0.0 when it agreed
         # everywhere); dist_threshold is the margin below which a disagreement
         # is boundary jitter rather than a different computation. The same
@@ -212,6 +222,8 @@ def run_validation(
         "per_nonce": per_nonce,
         "p_value": p_value,
         "fraud_detected": fraud_detected,
+        "n_excluded": len(excluded),
+        "excluded_nonces": excluded,
     }
     if use_trajectory and ref_vectors:
         vector_score = score_vector_channel(computed_artifacts, ref_vectors)
