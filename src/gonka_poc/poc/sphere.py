@@ -186,25 +186,42 @@ def snap_with_guard(
     return k, bad
 
 
-def snap_with_margin(
+def snap_with_scores(
     query: torch.Tensor, codebook: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`snap_with_guard` plus the top1-top2 cosine margin (how decisively the point
-    won). A small margin means the query sits right on a codebook boundary, where
-    tiny fp differences across HW/attention-backend flip the snap; a large margin
-    means it is firmly inside one cell. The validator gates its mismatch count on
-    this margin (``VLLM_POC_MARGIN_TAU``): a low-margin disagreement is boundary
-    jitter, not fraud. Margin is computed on the validator's OWN forward, so a
-    prover cannot see or steer it.
+    """`snap_with_guard` plus the full cosine score row against the codebook.
 
-    Returns ``(k, bad, margin)``: ``k`` [batch] int64 (``-1`` where non-finite),
-    ``bad`` [batch] bool, ``margin`` [batch] float32 (``0.0`` for non-finite rows).
+    The validator keeps the scores so a disagreement is judged against the cell
+    the prover CLAIMED (``claimed_margin``), not against the validator's own
+    runner-up: a query on the boundary of two cells forgives a claim of either
+    of those two, never of a cell on the far side of the sphere. Scores come
+    from the validator's OWN forward, so a prover cannot see or steer them.
+
+    Returns ``(k, bad, scores)``: ``k`` [batch] int64 (``-1`` where non-finite),
+    ``bad`` [batch] bool, ``scores`` [batch, SPHERE_POINTS] float32 (zeros for
+    non-finite rows).
     """
     bad = ~torch.isfinite(query).all(dim=-1)             # [batch]
-    sims = query.float() @ codebook.float().T            # [batch, SPHERE_POINTS]
-    top2 = sims.topk(2, dim=-1)
-    k = top2.indices[:, 0]
-    margin = (top2.values[:, 0] - top2.values[:, 1]).float()
+    scores = query.float() @ codebook.float().T          # [batch, SPHERE_POINTS]
+    k = scores.argmax(dim=-1)
     k = torch.where(bad, torch.full_like(k, -1), k)
-    margin = torch.where(bad, torch.zeros_like(margin), margin)
-    return k, bad, margin
+    scores = torch.where(bad.unsqueeze(-1), torch.zeros_like(scores), scores)
+    return k, bad, scores
+
+
+def claimed_margin(scores: torch.Tensor, claimed_k: torch.Tensor) -> torch.Tensor:
+    """How far the CLAIMED cell sits below the validator's best cell, per row:
+    ``best - scores[claimed_k]`` in cosine units. Zero when the claim is the
+    validator's own snap, the top1-top2 gap when it is the runner-up (boundary
+    jitter), up to 2.0 on the far side of the sphere. A claim outside the
+    codebook (``k`` not in ``[0, SPHERE_POINTS)``) names no cell and scores as
+    the maximal gap. The validator compares this against tau
+    (``stat_test.dist_threshold``).
+    """
+    n_points = scores.shape[-1]
+    valid = (claimed_k >= 0) & (claimed_k < n_points)
+    idx = torch.where(valid, claimed_k, torch.zeros_like(claimed_k))
+    best = scores.max(dim=-1).values
+    picked = scores.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    margin = best - picked
+    return torch.where(valid, margin, torch.full_like(margin, 2.0))

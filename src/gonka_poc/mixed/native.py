@@ -214,7 +214,7 @@ class PoCEmbeddingWrapper(nn.Module):
 class PoCSnapWrapper(nn.Module):
     """Wraps the model's FINAL norm. Runs it, then SNAPS the normed last hidden ->
     sphere_k IN-GRAPH for every row (PoC's 'sampler'), reusing the embed_* seed
-    buffers + codebook and writing per-row k/bad/margin/q to the state's snap_*
+    buffers + codebook and writing per-row k/bad/scores/q to the state's snap_*
     buffers. Returns the norm output unchanged so the LM head still runs. The runner
     index_selects the decode rows post-forward — no per-step index_copy_ feed, no
     separate tail graph replay (this in-graph snap replaced the old eager tail)."""
@@ -231,17 +231,17 @@ class PoCSnapWrapper(nn.Module):
         st = self._st
         n = h.shape[0]
         from gonka_poc.poc.decode_random import random_pick_indices_gpu
-        from gonka_poc.poc.sphere import project_to_sphere, snap_with_margin
+        from gonka_poc.poc.sphere import project_to_sphere, snap_with_scores
         lh = h.float()
         lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
         sph = random_pick_indices_gpu(
             st.embed_base[:n], st.embed_prev_k[:n], st.embed_step[:n],
             st.hidden_size, st.sphere_dim, h.device)
         q = project_to_sphere(torch.gather(lh, 1, sph))
-        k_all, bad_all, margin_all = snap_with_margin(q, st.codebook)
+        k_all, bad_all, scores_all = snap_with_scores(q, st.codebook)
         st.snap_k[:n].copy_(k_all)
         st.snap_bad[:n].copy_(bad_all)
-        st.snap_margin[:n].copy_(margin_all)
+        st.snap_scores[:n].copy_(scores_all)
         st.snap_q[:n].copy_(q)
         return out
 
@@ -433,13 +433,13 @@ class PoCNativeState:
         self.poc_token_ids = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         # PoC-as-a-sampler, part 2: SNAP = SAMPLING. A wrapper on the final norm snaps
         # the last hidden -> sphere_k IN-GRAPH (reusing the embed_* seed buffers + the
-        # codebook), writing per-row k/bad/margin/q here. The runner index_selects the
+        # codebook), writing per-row k/bad/scores/q here. The runner index_selects the
         # decode rows post-forward — no separate tail-graph feed (4 index_copy_/step).
-        from gonka_poc.poc.sphere import SPHERE_DIM, get_sphere_codebook
+        from gonka_poc.poc.sphere import SPHERE_DIM, SPHERE_POINTS, get_sphere_codebook
         self.sphere_dim = SPHERE_DIM
         self.snap_k = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.snap_bad = torch.zeros(max_tokens, dtype=torch.bool, device=device)
-        self.snap_margin = torch.zeros(max_tokens, dtype=torch.float32, device=device)
+        self.snap_scores = torch.zeros(max_tokens, SPHERE_POINTS, dtype=torch.float32, device=device)
         self.snap_q = torch.zeros(max_tokens, SPHERE_DIM, dtype=torch.float32, device=device)
         self.codebook = get_sphere_codebook().to(device=device).float().contiguous()
 
