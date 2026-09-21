@@ -8,6 +8,27 @@ from vllm.logger import init_logger
 
 from .data import decode_vector, fraud_test, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 
+# A nonce the validator could not score (non-finite hidden state, engine
+# failure — the runner drops it before it becomes an artifact) is no evidence
+# either way and leaves the sample; the verdict is over the nonces that were
+# scored. Past this share of the request the validator itself is suspect and
+# gives no verdict. Same rule for the prefill vector and the decode trajectory.
+MAX_UNSCORED_FRAC = 0.1
+
+
+def unscored_nonces(requested: List[int], computed_artifacts: List[Dict]) -> List[int]:
+    """Requested nonces that came back without an artifact.
+
+    Raises ValueError (no verdict) when more than MAX_UNSCORED_FRAC of the
+    request is missing.
+    """
+    have = {a["nonce"] for a in computed_artifacts}
+    missing = [n for n in requested if n not in have]
+    if len(missing) > max(1, int(len(requested) * MAX_UNSCORED_FRAC)):
+        raise ValueError(
+            f"{len(missing)} of {len(requested)} nonces produced no artifact")
+    return missing
+
 logger = init_logger(__name__)
 
 # Per-step vector-divergence tolerance: a decode step "diverged" if its pre-snap
@@ -156,27 +177,38 @@ def run_validation(
     k_dim: int = 12,
     use_trajectory: bool = False,
     ref_vectors: Optional[Dict[int, List[str]]] = None,
+    requested_nonces: Optional[List[int]] = None,
 ) -> Dict:
     """Run full validation with fraud test. Same response shape for both flows.
+
+    - requested_nonces (optional): the nonce set the request asked for. Nonces
+      without an artifact leave the sample (``excluded_nonces``; n_total is the
+      scored count); too many of them → ValueError, no verdict.
 
     - prefill (use_trajectory=False): vector-L2 per nonce + binomial fraud_test
       (uses p_mismatch + fraud_threshold). Unchanged.
     - decode (use_trajectory=True, max_tokens>0): a nonce mismatches when the
-      validator disagreed with the reference on some step with a snap margin
-      above dist_threshold (tau); then the same binomial fraud_test over nonces.
+      validator disagreed with the reference on some step where the claimed cell
+      scores more than dist_threshold (tau) below the validator's best cell;
+      then the same binomial fraud_test over nonces.
     - ref_vectors (optional, decode): prover-side sph_values_steps per nonce.
       When both sides carry pre-snap slices, the continuous vector-channel score
       (score_vector_channel) is attached as ``vector_score`` EVIDENCE — the
       verdict stays k-based so the two channels can be A/B'd on the same run.
     """
     per_nonce: List[Dict] = []   # per-nonce evidence
+    excluded: List[int] = []
+    if requested_nonces is not None:
+        excluded = unscored_nonces(requested_nonces, computed_artifacts)
+        n_total = len(computed_artifacts)
     if use_trajectory:
         # One nonce is one trial, exactly as in the prefill flow. The nonce's
-        # distance is the largest snap margin among the steps where the
-        # validator disagreed with the reference (0.0 when it agreed
-        # everywhere); dist_threshold is the margin below which a disagreement
-        # is boundary jitter rather than a different computation. The same
-        # binomial test then runs over nonces with p_mismatch/fraud_threshold.
+        # distance is the largest claimed margin (best - score[claimed k] on the
+        # validator's own query) among the steps where the validator disagreed
+        # with the reference (0.0 when it agreed everywhere); dist_threshold is
+        # the margin below which a disagreement is boundary jitter rather than
+        # a different computation. The same binomial test then runs over nonces
+        # with p_mismatch/fraud_threshold.
         n_mismatch = 0
         mismatch_nonces = []
         for a in computed_artifacts:
@@ -212,6 +244,8 @@ def run_validation(
         "per_nonce": per_nonce,
         "p_value": p_value,
         "fraud_detected": fraud_detected,
+        "n_excluded": len(excluded),
+        "excluded_nonces": excluded,
     }
     if use_trajectory and ref_vectors:
         vector_score = score_vector_channel(computed_artifacts, ref_vectors)
