@@ -1,4 +1,15 @@
-"""Compat shim for vLLM 0.25.x.
+"""Compat shim for vLLM 0.28.x.
+
+Copied from ``v0_25.py`` for the GLM-5.3-Flash base. Every private surface the
+0.25 shim depends on was checked against that base and is still present with
+the same name and shape: ``CommonAttentionMetadata`` (every field this shim
+passes), ``GPUModelRunner.kv_caches``, ``EngineCore`` with ``self.scheduler``,
+``Scheduler.kv_cache_manager``, ``KVCacheManager.block_pool``, ``BlockPool``'s
+``get_new_blocks``/``free_blocks``/``get_num_free_blocks``, and the
+``output_processor.request_states`` hook on ``AsyncLLM``.
+
+The FILE PATHS in the docstrings below still hold; the LINE NUMBERS are
+inherited from 0.25.1 and were not re-verified — treat them as historical.
 
 Every function below touches a vLLM private surface. Each docstring records:
   * the upstream symbol (with file path + line if stable);
@@ -6,7 +17,7 @@ Every function below touches a vLLM private surface. Each docstring records:
   * the contract-test reference that must stay green.
 
 If any of these shift in a future vLLM minor, copy this file to
-``v0_26.py``, edit the relevant function, and register the new dispatch
+``v0_29.py``, edit the relevant function, and register the new dispatch
 mapping in ``gonka_poc/_compat/__init__.py``.
 
 CommonAttentionMetadata import-path policy
@@ -66,7 +77,7 @@ def build_common_attention_metadata(
         C128A sparse-MLA builder and the SWA compressor, ``None``-safe for
         every other backend).
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.28.*
 
     Contract test:
         tests/contract/test_api_surface.py::test_common_attention_metadata_fields
@@ -150,7 +161,7 @@ def build_attn_metadata_per_group(
         * ``builder.build(common_prefix_len, common_attn_metadata)`` — the v1
           entry point for materialising backend-specific metadata.
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.28.*
 
     Contract test:
         tests/contract/test_api_surface.py::test_kv_caches_attribute
@@ -212,7 +223,7 @@ def get_kv_cache_pool(model_runner: Any) -> list:
     Upstream symbol: ``GPUModelRunner.kv_caches`` (list[torch.Tensor])
         declared at vllm/v1/worker/gpu_model_runner.py:550 (v0.25.1).
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.28.*
 
     Contract test:
         tests/contract/test_api_surface.py::test_kv_caches_attribute
@@ -280,7 +291,7 @@ async def abort_all_requests(engine_client: Any) -> int:
     Upstream symbol: ``vllm.engine.protocol.EngineClient.abort`` (ABC method;
         ``async def abort(request_id: str | Iterable[str]) -> None``).
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.28.*
 
     Contract test:
         tests/contract/test_api_surface.py::test_engine_client_has_abort
@@ -381,7 +392,7 @@ def install_engine_core_poc_methods() -> bool:
     Because the block-id namespace is pool-global, ONE lease reserves the
     id's byte range in EVERY group's tensors simultaneously.
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.28.*
 
     Contract test:
         tests/contract/test_api_surface.py::test_kv_block_pool_borrow_surface
@@ -467,7 +478,7 @@ async def borrow_poc_blocks(
     fails (callers treat it as feature-unavailable and fall back);
     returns ``None`` when the pool is merely busy.
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.28.*
     """
     parallel = getattr(
         getattr(engine_client, "vllm_config", None), "parallel_config", None)

@@ -1,127 +1,93 @@
 """PoC API routes for vLLM server."""
 import asyncio
+import contextlib
+import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Request, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
-from vllm.logger import init_logger
+import logging
+from gonka_poc.mixed.policy import poc_cfg
+from gonka_poc.poc.config import PoCState
+from gonka_poc.poc.data import (
+    Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_MARGIN_TAU, DEFAULT_P_MISMATCH,
+    DEFAULT_FRAUD_THRESHOLD,
+)
+from gonka_poc.poc.callbacks import CallbackSender
+from gonka_poc.poc.generate_queue import (
+    GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
+    compute_nonce_artifacts, drain_poc,
+)
+from gonka_poc.poc.reservation import poc_reservation
+from gonka_poc.poc.validation import run_validation
 from gonka_poc._compat import current as _compat_current
-from .config import (
-    GENERATION_ACTIVE_POLL_SEC,
-    POC_BATCH_SIZE_DEFAULT,
-    POC_GENERATE_CHUNK_TIMEOUT_SEC,
-    POC_MAX_QUEUED_NONCES,
-    POC_RPC_TIMEOUT_MS,
-    PoCState,
-)
-from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD, wire_encoding
-from .callbacks import CallbackSender
-from .generate_queue import GenerateJob, get_queue, clear_queue
-from .reservation import (
-    poc_reservation,
-    poc_validation_available,
-    reset_prefix_cache_after_inplace_poc,
-)
-from .validation import run_validation
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 
-# Backoff after a collective_rpc timeout in the mining loop.
-POC_RPC_TIMEOUT_BACKOFF_SEC = 0.1
+def _server_engine() -> dict:
+    """Engine identity of the SERVING box: version/commit, attention backend,
+    cudagraph mode. Server truth — never recorded client-side."""
+    out = {}
+    try:
+        import vllm
+        out["vllm_version"] = getattr(vllm, "__version__", "?")
+    except Exception:
+        pass
+    try:
+        import os
+        out["attention_backend"] = os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
+        out["v2_runner"] = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "?")
+    except Exception:
+        pass
+    return out
+
+
+def _server_gpu() -> str:
+    """The SERVING box's GPU — provenance must name the machine that computed
+    the artifacts, not whatever client collected them."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        return f"{n}x{torch.cuda.get_device_name(0)}" if n else "cpu"
+    except Exception:
+        return "?"
+
+
+
+POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
+POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
+POC_CHAT_BUSY_BACKOFF_SEC = 0.05
+POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
+# Request default when the chain sends no batch_size: 32, as in 3.0.16.
+POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 
+def resolve_mining_round(configured: int, engine_client, seq_len: int = 0,
+                         prefill: bool = True) -> int:
+    """How many nonces continuous mining pulls per iteration.
 
-async def _execute_poc_forward_rpc(
-    engine_client: Any,
-    *,
-    nonces: List[int],
-    block_hash: str,
-    public_key: str,
-    seq_len: int,
-    k_dim: int,
-    poc_stronger_rng: bool = False,
-    timeout_ms: int = POC_RPC_TIMEOUT_MS,
-    lease: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Run ``execute_poc_forward`` on every worker rank and aggregate.
-
-    ``lease`` is a KV block lease from :func:`poc_reservation`
-    (``{"block_ids": [...], "blocks_per_seq": int}``) — when present the
-    forward writes ONLY leased blocks and live inference stays intact;
-    ``None`` selects the legacy in-place layout (blocks 0..N — callers must
-    have aborted inference first).
-
-    Uses ``EngineClient.collective_rpc`` (vllm/engine/protocol.py) to invoke
-    :meth:`gonka_poc.worker.PoCWorkerExtension.execute_poc_forward` on each
-    rank. Each rank returns ``{"artifacts": [...], "rank": int}``;
-    PP non-last ranks return an empty list. We aggregate the union (in
-    practice only the PP last rank produces non-empty artifacts, but a
-    union is safe and handles non-PP topologies uniformly).
-
-    Args / kwargs mirror what ``PoCWorkerExtension.execute_poc_forward``
-    accepts. The vectors are already base64-encoded FP16 in the per-rank
-    result; we do not need to decode here -- the API response forwards the
-    ``vector_b64`` strings unchanged.
-
-    Returns: ``{"artifacts": [{"nonce": int, "vector_b64": str}, ...]}``.
-    """
-    if not nonces:
-        return {"artifacts": []}
-
-    if lease is None:
-        # In-place layout writes blocks 0..N unconditionally, and nothing
-        # gates new admissions on the validation path — re-drain in-flight
-        # inference before EVERY legacy chunk (upstream donor behaviour;
-        # requests admitted between chunks would otherwise be silently
-        # clobbered). During mining the gate keeps the in-flight set empty,
-        # so this is a cheap no-op there.
-        try:
-            await _compat_current().abort_all_requests(engine_client)
-        except Exception as exc:
-            logger.warning("PoC pre-chunk abort failed: %s", exc)
-
-    timeout_sec = timeout_ms / 1000.0
-    results = await engine_client.collective_rpc(
-        "execute_poc_forward",
-        timeout=timeout_sec,
-        kwargs={
-            "block_hash": block_hash,
-            "public_key": public_key,
-            "nonces": list(nonces),
-            "seq_len": int(seq_len),
-            "k_dim": int(k_dim),
-            "poc_stronger_rng": bool(poc_stronger_rng),
-            "borrowed_block_ids": (
-                list(lease["block_ids"]) if lease else None),
-            "borrowed_stripe": (
-                int(lease["blocks_per_seq"]) if lease else None),
-        },
-    )
-
-    # Aggregate per-rank artifacts. In a PP topology only the last rank
-    # populates artifacts; in TP-only it's typically the driver rank
-    # (whichever ran the forward to completion). De-duplicate by nonce so a
-    # buggy worker that doubles up doesn't corrupt the API response.
-    seen: set = set()
-    artifacts: List[Dict[str, Any]] = []
-    for rank_result in results:
-        if not rank_result:
-            continue
-        for art in rank_result.get("artifacts", []) or []:
-            nonce = art.get("nonce")
-            if nonce is None or nonce in seen:
-                continue
-            seen.add(nonce)
-            artifacts.append(art)
-
-    return {"artifacts": artifacts}
+    The chain's batch_size, verbatim, as in 3.0.16 (the request default is
+    POC_BATCH_SIZE_DEFAULT = 32). The decode scheme alone treats 0 as AUTO —
+    poc_max_batch_size from ``--additional-config``, then max_num_seqs — since its
+    rows are ordinary scheduler requests capped by max_num_seqs. A prefill-scheme
+    round is one forward; whether batch_size x seq_len fits the node is the
+    operator's configuration, the node does not resize it."""
+    if configured or prefill:
+        return configured
+    vc = getattr(engine_client, "vllm_config", None)
+    sc = getattr(vc, "scheduler_config", None)
+    resolved = int(poc_cfg(vc, "poc_max_batch_size") or 0) or getattr(sc, "max_num_seqs", 0)
+    if resolved:
+        return resolved
+    logger.warning("PoC mining: engine config unreadable, defaulting round to 32")
+    return 32
 
 
 # =============================================================================
@@ -133,6 +99,25 @@ class PoCParamsModel(BaseModel):
     model: str
     seq_len: int
     k_dim: int = 12
+    # Which proof the chain is asking for. Explicit, because the two are
+    # different derivations and a node must never guess: "prefill" is the
+    # v0.1.x scheme whose artifacts the deployed fleet validates, "decode"
+    # is the chained sphere_k trajectory. Absent => prefill, so a chain that
+    # knows nothing about decode keeps working unchanged.
+    scheme: Literal["prefill", "decode"] = "prefill"
+    # The same switch as a flag, mirroring PoCParams.poc_decode: the chain
+    # sends {"decode": true, "max_tokens": N}. Either form selects decode.
+    decode: bool = False
+    # Decode steps. Only read for the decode scheme.
+    max_tokens: int = 0
+
+    @model_validator(mode="after")
+    def _decode_flag(self):
+        if self.decode:
+            self.scheme = "decode"
+        elif self.scheme == "decode":
+            self.decode = True
+        return self
 
 
 class PoCInitGenerateRequest(BaseModel):
@@ -151,13 +136,7 @@ class PoCInitGenerateRequest(BaseModel):
 
 @dataclass
 class NonceIterator:
-    """Iterator for nonces with multi-node and multi-group support.
-
-    Binding contract: the offset/step formula
-    (nonce = node_id + group_id*n_nodes + x*(n_groups*n_nodes)) is the
-    network-wide disjoint nonce-partition scheme — frozen; changing it
-    breaks disjoint coverage across nodes/groups.
-    """
+    """Iterator for nonces with multi-node and multi-group support."""
     node_id: int
     n_nodes: int
     group_id: int
@@ -182,6 +161,10 @@ class NonceIterator:
 class ArtifactModel(BaseModel):
     nonce: int
     vector_b64: str
+    k_points_steps: Optional[List[int]] = None
+    n_sphere_mismatches: Optional[int] = None
+    sph_indices_steps: Optional[List[List[int]]] = None
+    sph_values_steps: Optional[List[str]] = None
 
 
 class ValidationModel(BaseModel):
@@ -208,6 +191,12 @@ class PoCGenerateRequest(BaseModel):
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
     poc_stronger_rng: bool = False
+    enforced_k_steps: Optional[Dict[int, List[int]]] = None
+    debug: bool = False
+    # Per-nonce Householder seeding (see PoCParams.per_nonce_reflection).
+    # Forward-affecting: a validation request MUST carry the same value the
+    # reference artifacts were generated with, or every chain diverges.
+    per_nonce_reflection: bool = False
 
 
 # =============================================================================
@@ -235,15 +224,11 @@ def check_params_match(request: Request, params: PoCParamsModel):
                     status_code=409,
                     detail={
                         "error": "params mismatch",
-                        "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim},
-                        "deployed": {"model": list(valid_models), "seq_len": None, "k_dim": None},
+                        "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim, "max_tokens": params.max_tokens},
+                        "deployed": {"model": list(valid_models), "seq_len": None, "k_dim": None, "max_tokens": None},
                     }
                 )
-    
-    # Optional integrator pin — set app.state.poc_deployed =
-    # {'model': ..., 'seq_len': ..., 'k_dim': ...} to enforce full param
-    # matching; nothing in this repo sets it, so by default only the model
-    # name is checked.
+
     deployed = getattr(request.app.state, 'poc_deployed', None)
     if deployed:
         mismatches = []
@@ -253,14 +238,19 @@ def check_params_match(request: Request, params: PoCParamsModel):
             mismatches.append("seq_len")
         if deployed.get("k_dim") and params.k_dim != deployed["k_dim"]:
             mismatches.append("k_dim")
-        
+        # max_tokens defines the decode trajectory length -> artifact-defining,
+        # so it must match the deployed config like seq_len/k_dim. Use "is not
+        # None" since max_tokens=0 (prefill-only) is a valid configured value.
+        if deployed.get("max_tokens") is not None and params.max_tokens != deployed["max_tokens"]:
+            mismatches.append("max_tokens")
+
         if mismatches:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "error": "params mismatch",
                     "fields": mismatches,
-                    "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim},
+                    "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim, "max_tokens": params.max_tokens},
                     "deployed": deployed,
                 }
             )
@@ -318,20 +308,9 @@ async def _cancel_poc_tasks(app_id: int):
                 await tasks["gen_task"]
             except asyncio.CancelledError:
                 pass
-        # Cancel the callback aiohttp loop too -- on re-init / shutdown it
-        # would otherwise keep POSTing until the process died. stop_event is
-        # already set above; that should let run() exit cleanly, but cancel
-        # as a belt-and-braces measure for the mid-POST case.
-        if tasks.get("callback_task"):
-            cb_task = tasks["callback_task"]
-            if not cb_task.done():
-                cb_task.cancel()
-                try:
-                    await cb_task
-                except (asyncio.CancelledError, Exception):
-                    pass
         if tasks.get("callback_sender"):
             tasks["callback_sender"].clear()
+
 
 
 
@@ -343,28 +322,32 @@ async def _compute_artifacts_chunk(
     seq_len: int,
     k_dim: int,
     poc_stronger_rng: bool = False,
+    poc_decode: bool = False,
+    max_tokens: int = 0,
+    enforced_k_steps: Optional[Dict[int, List[int]]] = None,
+    debug: bool = False,
+    per_nonce_reflection: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
+    block_height: int = 0,
     lease: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
-    """Compute artifacts for a chunk via collective_rpc.
+    """Compute artifacts for a chunk of nonces via the scheduler.
 
-    There is no longer a "skipped" backoff path: with a ``lease`` the
-    forward runs on KV blocks disjoint from live inference, and on the
-    legacy fallback (``lease is None``) the reservation layer has already
-    aborted in-flight inference.
+    Thin wrapper over generate_queue.compute_nonce_artifacts (the single source
+    of truth for PoC artifact computation). ``timeout_sec`` is accepted only for
+    call compatibility; the scheduler handles queuing/backoff.
     """
-    result = await _execute_poc_forward_rpc(
-        engine_client,
-        nonces=nonces,
-        block_hash=block_hash,
-        public_key=public_key,
-        seq_len=seq_len,
-        k_dim=k_dim,
+    return await compute_nonce_artifacts(
+        engine_client, nonces, block_hash, public_key, block_height,
+        seq_len, k_dim,
+        poc_decode=poc_decode,
+        max_tokens=max_tokens,
+        enforced_k_steps=enforced_k_steps,
+        debug=debug,
+        per_nonce_reflection=per_nonce_reflection,
         poc_stronger_rng=poc_stronger_rng,
-        timeout_ms=int(timeout_sec * 1000),
         lease=lease,
     )
-    return result.get("artifacts", [])
 
 
 # =============================================================================
@@ -384,8 +367,13 @@ async def _generation_loop(
         group_id=config["group_id"],
         n_groups=config["n_groups"],
     )
-    batch_size = config["batch_size"]
-    
+    # Continuous mining pulls a round of nonces per iteration. 0 = AUTO -> ask the ENGINE
+    # how many PoC sequences it can hold (poc_max_batch_size, auto-scaled to max_num_seqs)
+    # instead of a client-side constant, so a bigger machine mines a bigger round.
+    poc_decode = config.get("scheme", "prefill") == "decode"
+    batch_size = resolve_mining_round(config["batch_size"], engine_client,
+                                      config["seq_len"], prefill=not poc_decode)
+
     start_time = time.time()
     stats["start_time"] = start_time
     stats["total_processed"] = 0
@@ -394,36 +382,44 @@ async def _generation_loop(
     logger.info(f"PoC generation started (node {config['node_id']}/{config['node_count']}, group {config['group_id']}/{config['n_groups']})")
     timeout_count = 0
     pending_nonces = None
-
+    
     try:
         while not stop_event.is_set():
             nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
-
+            
             try:
-                result = await _execute_poc_forward_rpc(
-                    engine_client,
-                    nonces=nonces,
-                    block_hash=config["block_hash"],
-                    public_key=config["public_key"],
-                    seq_len=config["seq_len"],
-                    k_dim=config["k_dim"],
-                    poc_stronger_rng=config["poc_stronger_rng"],
-                    timeout_ms=POC_RPC_TIMEOUT_MS,
+                # Continuous generation: prefill-only when max_tokens==0 (default),
+                # or decode-PoC (sphere_k trajectory) when max_tokens>0. PoC rides
+                # through the scheduler alongside chat; no collective_rpc.
+                mt = config.get("max_tokens", 0)
+                artifacts = await _compute_artifacts_chunk(
+                    engine_client, nonces,
+                    config["block_hash"], config["public_key"],
+                    config["seq_len"], config["k_dim"],
+                    config["poc_stronger_rng"],
+                    poc_decode=(config.get("scheme", "prefill") == "decode"),
+                    max_tokens=mt,
+                    block_height=config["block_height"],
                 )
-                timeout_count = 0
             except (TimeoutError, asyncio.TimeoutError):
+                # Engine busy: retry the same chunk, as in 3.0.16. Any other
+                # error ends the round (the task's done-callback logs it and
+                # releases the gate).
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
                     logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
                 pending_nonces = nonces
-                await asyncio.sleep(POC_RPC_TIMEOUT_BACKOFF_SEC)
+                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
 
+            timeout_count = 0
             pending_nonces = None
-            artifacts = result.get("artifacts", [])
-            
+
             if artifacts and callback_sender:
-                artifact_objs = [Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"]) for a in artifacts]
+                artifact_objs = [Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"],
+                                          k_points_steps=a.get("k_points_steps"),
+                                          sph_values_steps=a.get("sph_values_steps"))
+                                 for a in artifacts]
                 callback_sender.add_artifacts(artifact_objs, {
                     "public_key": config["public_key"],
                     "block_hash": config["block_hash"],
@@ -446,56 +442,25 @@ async def _generation_loop(
     except Exception as e:
         logger.error(f"PoC generation crashed: {e}", exc_info=True)
         raise
-    finally:
-        # Mining wrote blocks 0..N in place without evicting their cached
-        # hashes — drop the prefix cache so later hits cannot serve
-        # PoC-clobbered KV (best-effort; see reservation module docstring).
-        await reset_prefix_cache_after_inplace_poc(engine_client)
 
 
 # =============================================================================
 # API Endpoints
 # =============================================================================
 
-def _get_gate(request: Request):
-    """Return the per-app PoCGate.
-
-    The gate is installed on ``app.state.gonka_gate`` by
-    :func:`gonka_poc.entrypoint.api_router.build_gonka_app`. If it's
-    missing the API server was not composed via that helper -- raise
-    500 so the operator notices the wiring bug immediately.
-    """
-    gate = getattr(request.app.state, "gonka_gate", None)
-    if gate is None:
-        raise HTTPException(
-            status_code=500,
-            detail="PoCGate not installed on app.state.gonka_gate "
-            "(gonka_poc.entrypoint.api_router.build_gonka_app must run "
-            "before the PoC router accepts traffic).",
-        )
-    return gate
-
-
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
-    logger.info(
-        f"PoC /init/generate: block_hash={body.block_hash} "
-        f"block_height={body.block_height} node={body.node_id}/{body.node_count} "
-        f"group={body.group_id}/{body.n_groups} batch_size={body.batch_size} "
-        f"url={bool(body.url)} poc_stronger_rng={body.poc_stronger_rng}"
-    )
-    logger.debug(f"PoC /init/generate full body: {body}")
+    logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
-    gate = _get_gate(request)
 
     app_id = id(request.app)
 
     if _is_generation_active(app_id):
         raise HTTPException(status_code=409, detail="Already generating")
-
+    
     await _cancel_poc_tasks(app_id)
-
+    
     config = {
         "block_hash": body.block_hash,
         "block_height": body.block_height,
@@ -506,95 +471,67 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         "n_groups": body.n_groups,
         "batch_size": body.batch_size,
         "seq_len": body.params.seq_len,
+        "max_tokens": body.params.max_tokens,
         "k_dim": body.params.k_dim,
+        "scheme": body.params.scheme,
         "poc_stronger_rng": body.poc_stronger_rng,
     }
-
+    
     stats = {"start_time": 0, "total_processed": 0}
     stop_event = asyncio.Event()
+    
+    # A mining round owns the node, whichever scheme: live inference is gated
+    # off (503) and drained first, as in 0.1.3 (ADR-0013 ordering: activate ->
+    # abort -> spawn), and /stop or the round's end re-opens it. The prefill
+    # scheme needs this for correctness (its forward writes KV blocks 1..N in
+    # place); the decode scheme could share the scheduler with chat, but a
+    # round next to live chat starves both sides, and the chain's UX is
+    # "PoC runs, inference pauses, artifacts get published".
+    gate = getattr(request.app.state, "gonka_gate", None)
+    if gate is None:
+        raise HTTPException(
+            status_code=503,
+            detail="PoCGate not installed on app.state.gonka_gate; a mining round "
+                   "cannot run next to live inference")
+    gate.activate("init-generate")
 
     callback_sender = None
     callback_task = None
-
-    # Activate the gate BEFORE creating the task so PoCGatingMiddleware
-    # starts returning 503 to /v1/chat/completions and /v1/completions
-    # immediately. The gate is the single source of truth for "PoC is
-    # currently running" -- no module-level flag.
-    #
-    # CRITICAL: gate.activate() flips ON before any guarded call. If the
-    # compat lookup or abort_all_requests raises, the gate would latch ON
-    # forever (no done-callback registered yet because no task spawned).
-    # Wrap activate -> abort -> spawn in try/except that deactivates the
-    # gate on any exception before re-raising. The done-callback below
-    # handles deactivation for the post-spawn happy path.
-    #
-    # Also: spawn callback_task INSIDE the try-block so an exception between
-    # spawn and the _poc_tasks store does not orphan the aiohttp loop --
-    # without this, CallbackSender.run() would keep hammering body.url
-    # forever (no stop_event signal, no cancel, no termination short of
-    # a process restart).
-    gate.activate("init-generate")
     try:
         if body.url:
             callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
             callback_task = asyncio.create_task(callback_sender.run())
 
-        # Abort any already-admitted chat/completions requests that snuck in
-        # before the gate flipped. PoCGatingMiddleware blocks NEW admissions;
-        # abort_all_requests() drains the in-flight set so PoC forwards run on
-        # an exclusively-owned GPU. Ordering contract (ADR-0013): gate.activate
-        # -> abort_all_requests -> spawn gen task. This depends on the compat
-        # dispatch shim for the `current()` module lookup.
-        compat = _compat_current()
-        aborted = await compat.abort_all_requests(engine_client)
-        logger.info(
-            "PoC init: aborted %d in-flight requests before generation", aborted
-        )
+        if gate is not None:
+            aborted = await _compat_current().abort_all_requests(engine_client)
+            logger.info("PoC init: aborted %d in-flight requests before generation",
+                        aborted)
 
         gen_task = asyncio.create_task(
             _generation_loop(engine_client, stop_event, callback_sender, config, stats)
         )
 
         def _on_generation_done(task: asyncio.Task):
-            gate.deactivate()
+            if gate is not None:
+                gate.deactivate()
             if task.cancelled():
-                logger.info("PoC generation task cancelled, gate deactivated")
+                logger.info("PoC generation task cancelled, gate released")
             elif task.exception():
-                logger.warning("PoC generation task failed, gate deactivated: %s",
+                logger.warning("PoC generation task failed, gate released: %s",
                                task.exception())
             else:
-                logger.info("PoC generation task completed, gate deactivated")
+                logger.info("PoC generation task completed, gate released")
 
         gen_task.add_done_callback(_on_generation_done)
     except Exception:
-        # Anything between activate() and add_done_callback() failing means
-        # the done-callback path will never deactivate. Deactivate here so
-        # the gate does not latch ON across operator retries.
-        #
-        # If callback_task was spawned before the failure (body.url set +
-        # compat / abort / spawn raised), tear it down too: set the
-        # stop_event so CallbackSender.run() exits its loop cleanly, wait a
-        # bounded time for in-flight aiohttp POST to wrap up, then cancel
-        # if it overran. 5.0s is a pragmatic ceiling -- long enough for a
-        # mid-flight POST + one backoff sleep, short enough that operator
-        # retries (which call this same path) do not stack.
+        # Nothing between activate() and add_done_callback() may leave the
+        # gate latched ON across operator retries.
         if callback_task is not None:
             stop_event.set()
-            try:
-                await asyncio.wait_for(callback_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                callback_task.cancel()
-                try:
-                    await callback_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            except (asyncio.CancelledError, Exception):
-                pass
-        gate.deactivate()
-        logger.exception(
-            "PoC init: failed between gate.activate() and task spawn; "
-            "gate deactivated (init-generate-failed) before re-raising"
-        )
+            callback_task.cancel()
+        if gate is not None:
+            gate.deactivate()
+        logger.exception("PoC init: failed before the generation task was spawned")
         raise
     
     _poc_tasks[app_id] = {
@@ -611,31 +548,62 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 
 @router.post("/generate")
 async def generate(request: Request, body: PoCGenerateRequest) -> dict:
+    # Summarize validation in the log: with debug or poc_vector_artifacts
+    # refs its artifacts carry
+    # per-step sph_values_steps (multi-MB) — never dump the body wholesale.
+    val_log = (f"validation[{len(body.validation.artifacts)} artifacts]"
+               if body.validation else None)
     logger.info(
-        f"PoC /generate: block_hash={body.block_hash} "
-        f"block_height={body.block_height} node={body.node_id}/{body.node_count} "
-        f"batch_size={body.batch_size} nonces={len(body.nonces)} "
-        f"wait={body.wait} validation={bool(body.validation)} "
-        f"url={bool(body.url)} poc_stronger_rng={body.poc_stronger_rng}"
-    )
-    logger.debug(f"PoC /generate full body: {body}")
+        f"PoC /generate: {body.block_hash}, {body.block_height}, "
+        f"{body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, "
+        f"{body.params}, {body.batch_size}, {body.wait}, {body.url}, "
+        f"{val_log}, {body.stat_test}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
-    
+
     app_id = id(request.app)
-    
+
     if body.validation:
         validation_nonces = set(a.nonce for a in body.validation.artifacts)
         if validation_nonces != set(body.nonces):
             raise HTTPException(status_code=400, detail="validation.artifacts nonces must match nonces field")
-    
+
+    enforced_k_steps = body.enforced_k_steps
+    if (body.validation and body.params.scheme == "decode"
+            and enforced_k_steps is None):
+        # The wire form carries the reference trajectory inside each artifact.
+        # Without teacher-forcing it, every computed artifact comes back with
+        # n_sphere_mismatches=-1 (nothing compared) and the verdict is vacuous.
+        missing = [a.nonce for a in body.validation.artifacts
+                   if not a.k_points_steps]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=("decode validation needs k_points_steps for every "
+                        f"artifact, missing for nonces {missing[:8]}"))
+        enforced_k_steps = {a.nonce: list(a.k_points_steps)
+                            for a in body.validation.artifacts}
+
     validation_map = {a.nonce: a.vector_b64 for a in body.validation.artifacts} if body.validation else None
-    stat_test = body.stat_test or StatTestModel()
+    # prover-side pre-snap slices (reference generated with debug or
+    # poc_vector_artifacts):
+    # lets run_validation attach the continuous vector-channel score as evidence.
+    ref_vectors = {a.nonce: a.sph_values_steps for a in body.validation.artifacts
+                   if a.sph_values_steps} if body.validation else None
+    stat_test = body.stat_test or StatTestModel(
+        dist_threshold=(DEFAULT_MARGIN_TAU if body.params.scheme == "decode"
+                        else DEFAULT_DIST_THRESHOLD))
     
     if not body.wait:
         queue = get_queue()
         queue.set_generation_active_check(_is_generation_active)
-
+        
+        if queue.queued_nonces + len(body.nonces) > POC_MAX_QUEUED_NONCES:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Queue full: {queue.queued_nonces} nonces queued, limit is {POC_MAX_QUEUED_NONCES}"
+            )
+        
         job = GenerateJob(
             request_id=str(uuid.uuid4()),
             engine_client=engine_client,
@@ -650,7 +618,13 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             k_dim=body.params.k_dim,
             batch_size=body.batch_size,
             poc_stronger_rng=body.poc_stronger_rng,
+            poc_decode=(body.params.scheme == "decode"),
+            max_tokens=body.params.max_tokens,
+            enforced_k_steps=enforced_k_steps,
+            debug=body.debug,
+            per_nonce_reflection=body.per_nonce_reflection,
             validation_artifacts=validation_map,
+            ref_vectors=ref_vectors,
             stat_test_dist_threshold=stat_test.dist_threshold,
             stat_test_p_mismatch=stat_test.p_mismatch,
             stat_test_fraud_threshold=stat_test.fraud_threshold,
@@ -669,32 +643,47 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         return {"status": "queued", "request_id": request_id, "queued_count": len(body.nonces)}
     
     while _is_generation_active(app_id):
-        await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
-
+        await asyncio.sleep(0.1)
+    
     total_nonces = len(body.nonces)
-    n_chunks = (total_nonces + body.batch_size - 1) // body.batch_size
+    step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
+    n_chunks = (total_nonces + step - 1) // step
     logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
 
     start_time = time.time()
     computed_artifacts = []
+    poc_decode = body.params.scheme == "decode"
 
-    # One lease per request, reused across chunks; lease=None ⇒ inference
-    # already aborted, legacy in-place layout — see poc_reservation.
-    async with poc_reservation(
-        engine_client, body.batch_size, body.params.seq_len,
-    ) as lease:
-        for i in range(0, total_nonces, body.batch_size):
-            chunk = body.nonces[i:i + body.batch_size]
-            chunk_idx = i // body.batch_size
+    # One lease per request, reused across chunks; lease=None => inference has
+    # already been aborted and the forward falls back to the legacy in-place
+    # layout over blocks 1..N -- see poc_reservation. Decode is deliberately
+    # left outside: it shares the scheduler with live chat by design.
+    async with contextlib.AsyncExitStack() as _stack:
+        lease = None if poc_decode else await _stack.enter_async_context(
+            poc_reservation(engine_client, step, body.params.seq_len))
+        for i in range(0, total_nonces, step):
+            chunk = body.nonces[i:i + step]
+            chunk_idx = i // step
 
             while _is_generation_active(app_id):
-                await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
+                await asyncio.sleep(0.1)
+
+            chunk_inference_steps = None
+            if enforced_k_steps:
+                chunk_inference_steps = {n: enforced_k_steps[n]
+                                         for n in chunk if n in enforced_k_steps}
 
             try:
                 artifacts = await _compute_artifacts_chunk(
                     engine_client, chunk, body.block_hash, body.public_key,
                     body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
-                    POC_GENERATE_CHUNK_TIMEOUT_SEC,
+                    poc_decode=poc_decode,
+                    max_tokens=body.params.max_tokens,
+                    enforced_k_steps=chunk_inference_steps,
+                    debug=body.debug,
+                    per_nonce_reflection=body.per_nonce_reflection,
+                    timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
+                    block_height=body.block_height,
                     lease=lease,
                 )
                 computed_artifacts.extend(artifacts)
@@ -711,22 +700,49 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "status": "completed",
             "request_id": str(uuid.uuid4()),
             "artifacts": computed_artifacts,
-            "encoding": wire_encoding(body.params.k_dim),
+            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
+            "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
         }
     
-    validation_result = run_validation(
-        computed_artifacts=computed_artifacts,
-        validation_map=validation_map,
-        n_total=len(body.nonces),
-        dist_threshold=stat_test.dist_threshold,
-        p_mismatch=stat_test.p_mismatch,
-        fraud_threshold=stat_test.fraud_threshold,
-        k_dim=body.params.k_dim,
-    )
-    
+    if len(computed_artifacts) != len(body.nonces):
+        # A verdict is only meaningful over the full requested nonce set. Missing
+        # artifacts (dead engine, timeout) are NOT evidence of honesty: the
+        # mismatch counters simply never see those nonces, so the rate collapses
+        # toward zero and a broken validator would clear everyone it fails on.
+        raise HTTPException(
+            status_code=503,
+            detail=(f"validation aborted: {len(computed_artifacts)} of "
+                    f"{len(body.nonces)} nonces produced an artifact"))
+
+    try:
+        validation_result = run_validation(
+            computed_artifacts=computed_artifacts,
+            validation_map=validation_map,
+            n_total=len(body.nonces),
+            dist_threshold=stat_test.dist_threshold,
+            p_mismatch=stat_test.p_mismatch,
+            fraud_threshold=stat_test.fraud_threshold,
+            k_dim=body.params.k_dim,
+            # decode flow (max_tokens>0) → per-nonce snap margin vs dist_threshold
+            # (tau); prefill flow → vector-L2 vs dist_threshold. Same binomial,
+            # same response shape.
+            use_trajectory=body.params.max_tokens > 0,
+            ref_vectors=ref_vectors,
+        )
+    except ValueError as e:
+        # No comparison happened for some artifact: not a verdict.
+        raise HTTPException(status_code=503, detail=f"validation aborted: {e}")
+
     return {
         "status": "completed",
         "request_id": str(uuid.uuid4()),
+        # debug: expose the validator's own artifacts (incl. sph_values_steps) so a
+        # client can pair them with the prover's for offline vector-channel analysis;
+        # verdict-only response otherwise (unchanged).
+        "artifacts": computed_artifacts if body.debug else [],
+        "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
         **validation_result,
     }
 
@@ -750,13 +766,15 @@ async def get_generate_result(request: Request, request_id: str) -> dict:
 
 @router.get("/versions")
 async def get_versions(request: Request) -> dict:
-    """Feature-detection handshake for the network node.
+    """Feature-detection handshake for the network node (ADR-0015 §6).
 
-    ``poc_validation_inference`` advertises that ``/generate`` validation
-    runs on leased KV blocks concurrently with live inference (port of
-    gonka-ai/vllm qd/combine-poc-and-inference). It reflects an actual
-    probe (borrow RPC reachable AND the config is not scratch-capable) —
-    never a hardcoded literal.
+    ``poc_validation_inference`` used to reflect a borrow-RPC probe: whether
+    validation could run on leased KV blocks while inference kept serving.
+    Mixed decode-PoC removes the lease mechanism because coexistence is no
+    longer conditional — PoC and chat share the scheduler and the batch, so
+    validation always runs alongside inference. The field stays because the
+    node reads it to decide whether it may keep serving during a round; it is
+    now unconditionally true rather than a probe.
     """
     from vllm import __version__ as vllm_version
     try:
@@ -764,12 +782,10 @@ async def get_versions(request: Request) -> dict:
         gonka_poc_version = _md.version("gonka-poc")
     except Exception:
         gonka_poc_version = "unknown"
-    engine_client = await get_engine_client(request)
     return {
         "vllm_version": vllm_version,
         "gonka_poc_version": gonka_poc_version,
-        "poc_validation_inference":
-            await poc_validation_available(engine_client),
+        "poc_validation_inference": True,
     }
 
 
@@ -783,13 +799,14 @@ async def stop_round(request: Request) -> dict:
     app_id = id(request.app)
 
     await _cancel_poc_tasks(app_id)
-    await clear_queue()
-
-    # Deactivate the gate after task cancellation so the chat endpoint
-    # cannot squeeze a request in between cancellation and gate clear.
-    # NOTE: the gen_task done-callback also calls deactivate(); this is
-    # idempotent (PoCGate.deactivate clears the flag unconditionally).
+    # The generation task's done-callback releases the gate; clear it here too
+    # so a stop always re-opens inference (deactivate is idempotent).
     gate = getattr(request.app.state, "gonka_gate", None)
     if gate is not None:
         gate.deactivate()
-    return {"status": "OK", "pow_status": {"status": PoCState.STOPPED.value}}
+    await clear_queue()
+    # Cancelling the task does not evict requests already inside the engine:
+    # a round started while they drain shares a forward with them and every
+    # trajectory in it comes out different. Report STOPPED only once idle.
+    await drain_poc()
+    return {"status": "OK", "pow_status": {"status": "STOPPED"}}
