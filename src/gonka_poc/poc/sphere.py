@@ -185,26 +185,24 @@ def snap_with_guard(
     k = torch.where(bad, torch.full_like(k, -1), k)
     return k, bad
 
-
-def snap_with_margin(
+def snap_with_scores(
     query: torch.Tensor, codebook: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`snap_with_guard` plus the top1-top2 cosine margin (how decisively the point
-    won). A small margin means the query sits right on a codebook boundary, where
-    tiny fp differences across HW/attention-backend flip the snap; a large margin
-    means it is firmly inside one cell. The validator gates its mismatch count on
-    this margin (``VLLM_POC_MARGIN_TAU``): a low-margin disagreement is boundary
-    jitter, not fraud. Margin is computed on the validator's OWN forward, so a
-    prover cannot see or steer it.
-
-    Returns ``(k, bad, margin)``: ``k`` [batch] int64 (``-1`` where non-finite),
-    ``bad`` [batch] bool, ``margin`` [batch] float32 (``0.0`` for non-finite rows).
-    """
+    """`snap_with_guard` plus the cosine score row ``[batch, SPHERE_POINTS]``
+    (zeros for non-finite rows), kept so a disagreement is judged against the
+    claimed cell (``claimed_margin``)."""
     bad = ~torch.isfinite(query).all(dim=-1)             # [batch]
-    sims = query.float() @ codebook.float().T            # [batch, SPHERE_POINTS]
-    top2 = sims.topk(2, dim=-1)
-    k = top2.indices[:, 0]
-    margin = (top2.values[:, 0] - top2.values[:, 1]).float()
-    k = torch.where(bad, torch.full_like(k, -1), k)
-    margin = torch.where(bad, torch.zeros_like(margin), margin)
-    return k, bad, margin
+    scores = query.float() @ codebook.float().T          # [batch, SPHERE_POINTS]
+    k = torch.where(bad, torch.full_like(bad, -1, dtype=torch.int64), scores.argmax(dim=-1))
+    scores = torch.where(bad.unsqueeze(-1), torch.zeros_like(scores), scores)
+    return k, bad, scores
+
+
+def claimed_margin(scores: torch.Tensor, claimed_k: torch.Tensor) -> torch.Tensor:
+    """``best - scores[claimed_k]`` per row: 0 for the validator's own snap, the
+    top1-top2 gap for its runner-up (boundary jitter), ~0.7+ for a far cell; a
+    claim outside the codebook scores 2.0."""
+    n = scores.shape[-1]
+    valid = (claimed_k >= 0) & (claimed_k < n)
+    picked = scores.gather(-1, claimed_k.clamp(0, n - 1).unsqueeze(-1)).squeeze(-1)
+    return torch.where(valid, scores.max(dim=-1).values - picked, torch.full_like(picked, 2.0))
