@@ -190,6 +190,11 @@ async def compute_nonce_artifacts(
                             "chain is NOT work — it must not be scored.",
                             nonce, got, max_tokens + 1,
                             " (EMPTY)" if got == 0 else "")
+                    if artifact["n_nan_steps"]:
+                        # a non-finite step is a compute fault: no -1 on the wire, no vote
+                        logger.warning("PoC nonce %s: %d non-finite step(s) — artifact dropped",
+                                       nonce, artifact["n_nan_steps"])
+                        return None
                 return artifact
         except Exception as e:
             logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
@@ -484,17 +489,11 @@ class GenerateQueue:
             "server_engine": _server_engine(),
             }
         
-        if len(computed_artifacts) != len(job.nonces):
-            # Same rule as the wait path: a verdict over a partial nonce set is
-            # not evidence of honesty, it is a failed job.
-            raise RuntimeError(
-                f"validation aborted: {len(computed_artifacts)} of "
-                f"{len(job.nonces)} nonces produced an artifact")
-
         validation_result = run_validation(
             computed_artifacts=computed_artifacts,
             validation_map=job.validation_artifacts,
-            n_total=len(job.nonces),
+            n_total=len(computed_artifacts),
+            requested_nonces=job.nonces,
             dist_threshold=job.stat_test_dist_threshold,
             p_mismatch=job.stat_test_p_mismatch,
             fraud_threshold=job.stat_test_fraud_threshold,
@@ -543,6 +542,8 @@ class GenerateQueue:
                 "mismatch_nonces": result.get("mismatch_nonces", []),
                 "p_value": result.get("p_value", 1.0),
                 "fraud_detected": result.get("fraud_detected", False),
+                "n_excluded": result.get("n_excluded", 0),
+                "excluded_nonces": result.get("excluded_nonces", []),
                 # continuous vector-channel evidence (present when the reference
                 # artifacts carried sph_values_steps); None otherwise.
                 "vector_score": result.get("vector_score"),

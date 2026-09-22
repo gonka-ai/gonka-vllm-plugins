@@ -30,8 +30,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # SNAP MARGIN (validator-side). Every teacher-forced disagreement is counted, and the
-# largest snap margin (top1-top2 cosine gap of the validator's OWN query) among the
-# disagreeing steps is emitted as the nonce's distance. A tiny margin means the query
+# largest claimed margin (the validator's OWN best cell minus its score of the cell
+# the prover claimed, sphere.claimed_margin) among the disagreeing steps is emitted
+# as the nonce's distance. A tiny margin means the claim is the runner-up of a query that
 # sat on a codebook boundary, where cross-HW/backend fp jitter flips the snap; a
 # structured fraud pushes the query decisively into a wrong cell. The threshold that
 # separates the two (tau) is NOT applied here: it arrives with the validation request
@@ -166,11 +167,11 @@ class PoCDecodeState:
     prev_k_t: "torch.Tensor | None" = None        # [1] int64, chained on device
     reference_t: "torch.Tensor | None" = None     # [R] int64 uploaded reference
     k_steps_t: list = field(default_factory=list)  # list of [1] int64; cat+tolist at end
-    # margin trajectory, parallel to k_steps_t. The mismatch count is DEFERRED to
-    # emit (one batched reduction over k+margin vs the reference) instead of a
+    # score-row trajectory ([1, SPHERE_POINTS] each), parallel to k_steps_t. The mismatch
+    # count is DEFERRED to emit (one batched reduction over k+scores vs the reference) instead of a
     # per-step accumulate; n_nan is derived at emit from k == -1 (the snap marks
     # non-finite steps that way). So the hot decode loop does no counter ops.
-    margin_steps_t: list = field(default_factory=list)
+    scores_steps_t: list = field(default_factory=list)
     # per-step pre-snap sphere slices (the q whose argmax is sphere_k) for
     # PoCOutput.sph_values_steps: every step under debug or poc_vector_artifacts
     # (the seeded k_dim-coord pick is applied at emit — see encode_sph_slices).
@@ -546,7 +547,8 @@ def process_poc_outputs_from_hidden(
     )
     from gonka_poc.poc.data import encode_vector
     from gonka_poc.poc.sphere import (
-        SPHERE_DIM, get_sphere_codebook, project_to_sphere, snap_with_margin,
+        SPHERE_DIM, claimed_margin, get_sphere_codebook, project_to_sphere,
+        snap_with_scores,
     )
 
     poc_outputs = {}
@@ -591,12 +593,12 @@ def process_poc_outputs_from_hidden(
             return encode_vector(yk.half().cpu().numpy())
 
         def _sphere_from_idx(sph):
-            """hidden -> (sphere index, non-finite mask, margin, pre-snap slice) as
-            [1]/[1]/[1]/[1, SPHERE_DIM] TENSORs (no .item(), so the chain stays on
+            """hidden -> (sphere index, non-finite mask, scores, pre-snap slice) as
+            [1]/[1]/[1, SPHERE_POINTS]/[1, SPHERE_DIM] TENSORs (no .item(), so the chain stays on
             GPU and async scheduling works)."""
             xk_sphere = project_to_sphere(torch.gather(last_hidden.unsqueeze(0), 1, sph))
-            k_, bad_, margin_ = snap_with_margin(xk_sphere, codebook)
-            return k_, bad_, margin_, xk_sphere
+            k_, bad_, scores_ = snap_with_scores(xk_sphere, codebook)
+            return k_, bad_, scores_, xk_sphere
 
         if st is None:
             # Prefill-only PoC: just the vector_b64 artifact.
@@ -618,10 +620,10 @@ def process_poc_outputs_from_hidden(
         sph0 = random_pick_indices_decode(
             poc_params.block_hash, poc_params.public_key, [nonce],
             hidden_size, SPHERE_DIM, runner.device)
-        k0_t, _bad0, margin0, q0 = _sphere_from_idx(sph0)   # [1]/[1]/[1]/[1,SPHERE_DIM]
+        k0_t, _bad0, scores0, q0 = _sphere_from_idx(sph0)   # [1]/[1]/[1,P]/[1,SPHERE_DIM]
         # (nan is derived at emit from k == -1; _bad0 no longer accumulated per step)
         st.k_steps_t = [k0_t]
-        st.margin_steps_t = [margin0]                       # for the deferred mismatch (emit)
+        st.scores_steps_t = [scores0]                       # for the deferred mismatch (emit)
         # emission only — forward unchanged (contract: q_steps_t field doc)
         st.q_steps_t = [q0.detach()] if (poc_params.debug or va_on) else []
         if st.reference is not None:
@@ -667,7 +669,7 @@ def process_poc_outputs_from_hidden(
                     [m['start_idx'] + m['length'] - 1 for m in decode_metas],
                     torch.long, device)
                 k_all = _nat.snap_k.index_select(0, rows)
-                margin_all = _nat.snap_margin.index_select(0, rows)
+                scores_all = _nat.snap_scores.index_select(0, rows)
                 # snap_bad is never read here (n_nan is derived at emit from k == -1),
                 # and snap_q only feeds kept q artifacts. Both were dead index_select
                 # launches on the honest hot path -> pull snap_q only when kept, skip
@@ -691,10 +693,10 @@ def process_poc_outputs_from_hidden(
                                          "snap")
                 steps = pinned_to_device([m['decode_step'] for m in decode_metas], torch.int64, device)
                 sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
-                # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
-                # (compute fault, NOT fraud). bad_all/margin_all stay on device (no per-step sync).
+                # snap_with_scores: argmax(NaN) is garbage -> non-finite rows return k=-1
+                # (compute fault, NOT fraud). bad_all/scores_all stay on device (no per-step sync).
                 q_all = project_to_sphere(torch.gather(lh, 1, sph))          # [B, SPHERE_DIM]
-                k_all, bad_all, margin_all = snap_with_margin(q_all, codebook)  # [B] each
+                k_all, bad_all, scores_all = snap_with_scores(q_all, codebook)  # [B], [B], [B, P]
 
         # q_clone: one clone of q for the whole batch (the loop then only does cheap
         # views + list appends). Shared by this step's kept rows, alive until emit.
@@ -706,7 +708,7 @@ def process_poc_outputs_from_hidden(
             step = meta['decode_step']
             k_t = k_all[i:i + 1]                               # [1] tensor (view)
             st.k_steps_t.append(k_t)
-            st.margin_steps_t.append(margin_all[i:i + 1])     # deferred mismatch (emit)
+            st.scores_steps_t.append(scores_all[i:i + 1])     # deferred mismatch (emit)
             if keep_q_step(step, meta['poc_params'].debug, va_on):
                 st.q_steps_t.append(q_clone[i:i + 1])         # view into the one per-step clone
             # chain only (teacher-forced ref, or free-running k) — no per-step counters
@@ -727,14 +729,14 @@ def process_poc_outputs_from_hidden(
                 n_nan = int((k_traj == -1).sum().item())
                 mismatch_margin_max = 0.0
                 if st.reference_t is not None:
-                    margin_traj = torch.cat(st.margin_steps_t)
                     L = min(k_traj.shape[0], st.reference_t.shape[0])
                     disagree = ((k_traj[:L] != st.reference_t[:L])
                                 & (k_traj[:L] >= 0))
                     n_mismatches = int(disagree.sum().item())
                     if n_mismatches:
-                        mismatch_margin_max = float(
-                            margin_traj[:L][disagree].max().item())
+                        scores_traj = torch.cat(st.scores_steps_t)[:L]
+                        mismatch_margin_max = float(claimed_margin(
+                            scores_traj, st.reference_t[:L])[disagree].max().item())
                 else:
                     n_mismatches = -1
                 if n_nan:

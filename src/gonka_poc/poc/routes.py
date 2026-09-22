@@ -705,21 +705,12 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "server_engine": _server_engine(),
         }
     
-    if len(computed_artifacts) != len(body.nonces):
-        # A verdict is only meaningful over the full requested nonce set. Missing
-        # artifacts (dead engine, timeout) are NOT evidence of honesty: the
-        # mismatch counters simply never see those nonces, so the rate collapses
-        # toward zero and a broken validator would clear everyone it fails on.
-        raise HTTPException(
-            status_code=503,
-            detail=(f"validation aborted: {len(computed_artifacts)} of "
-                    f"{len(body.nonces)} nonces produced an artifact"))
-
     try:
         validation_result = run_validation(
             computed_artifacts=computed_artifacts,
             validation_map=validation_map,
-            n_total=len(body.nonces),
+            n_total=len(computed_artifacts),
+            requested_nonces=body.nonces,
             dist_threshold=stat_test.dist_threshold,
             p_mismatch=stat_test.p_mismatch,
             fraud_threshold=stat_test.fraud_threshold,
