@@ -1,14 +1,22 @@
-"""``gonka-vllm-serve`` -- compose a FastAPI app on top of stock vLLM (0.25.x).
+"""``gonka-vllm-serve`` -- compose a FastAPI app on top of stock vLLM.
 
-This is a thin wrapper around the upstream public API:
+This is a thin wrapper around the upstream server entry. The upstream symbols
+moved in vLLM 0.28.1 and again in 0.30.0, so each one is resolved through a
+short list of known locations (newest first):
 
-    vllm.entrypoints.openai.api_server.setup_server
-    vllm.entrypoints.openai.api_server.build_async_engine_client
-    vllm.entrypoints.openai.api_server.build_app
-    vllm.entrypoints.openai.api_server.init_app_state
-    vllm.entrypoints.launcher.serve_http
-    vllm.entrypoints.openai.cli_args.make_arg_parser
-    vllm.entrypoints.openai.cli_args.validate_parsed_serve_args
+    setup_server, serve_http     vllm.entrypoints.launchers.launcher
+                                 (before 0.28.1: vllm.entrypoints.openai.api_server /
+                                 vllm.entrypoints.launcher)
+    build_async_engine_client    vllm.entrypoints.launchers.api_server.entry
+    build_app                    vllm.entrypoints.launchers.app
+    init_app_state               vllm.entrypoints.launchers.api_server.app_state
+                                 (before 0.30.0 the three above lived in
+                                 vllm.entrypoints.openai.api_server)
+    make_arg_parser,
+    validate_parsed_serve_args   vllm.entrypoints.launchers.cli_args
+                                 (before 0.28.1: vllm.entrypoints.openai.cli_args)
+    get_uvicorn_log_config       vllm.entrypoints.launchers.utils.server_utils
+                                 (before 0.30.0: vllm.entrypoints.serve.utils.server_utils)
 
 We do NOT patch any vLLM source file. We only:
   1. Build the stock FastAPI app via ``build_app(args, ...)``.
@@ -17,17 +25,20 @@ We do NOT patch any vLLM source file. We only:
   3. Install ``PoCGatingMiddleware`` AFTER ``build_app`` returns so it ends up
      OUTERMOST in Starlette's reverse-insertion order, gating the
      ``/v1/chat/completions`` and ``/v1/completions`` routes with 503 when PoC
-     is active.
-  4. Forward to ``serve_http`` exactly like upstream's ``run_server_worker``.
+     is active -- unless the engine build already installed the gate inside
+     ``build_app`` (the 0.28/0.30 residual does), in which case the app is left
+     as built.
+  4. Forward to ``serve_http`` exactly like upstream's ``build_and_serve``.
 
 Middleware ordering note (verified against v0.23.0
-``vllm/entrypoints/openai/api_server.py:156-300``): user-supplied
-``--middleware`` are added at L287-297; we add OURS AFTER ``build_app`` so we
-sit outside them too. The chat-completion handler is reached only if the gate
-is open.
+``vllm/entrypoints/openai/api_server.py:156-300`` and v0.30.0
+``vllm/entrypoints/launchers/app.py``): user-supplied ``--middleware`` are
+added inside ``build_app``; we add OURS AFTER ``build_app`` so we sit outside
+them too. The chat-completion handler is reached only if the gate is open.
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import signal
 import sys
@@ -46,8 +57,30 @@ from gonka_poc.entrypoint.gating import (
 logger = logging.getLogger("gonka_poc.entrypoint")
 
 
+def _resolve(symbol: str, *module_names: str) -> Any:
+    """Import ``symbol`` from the first of ``module_names`` that provides it.
+
+    The candidates are ordered newest layout first. Raises ``ImportError``
+    naming every location tried, so a future move shows up as one clear
+    message instead of a bare ``ModuleNotFoundError`` deep in the launcher.
+    """
+    tried: list[str] = []
+    for name in module_names:
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            tried.append(name)
+            continue
+        if hasattr(module, symbol):
+            return getattr(module, symbol)
+        tried.append(f"{name} (no {symbol})")
+    raise ImportError(
+        f"gonka-vllm-serve: cannot import {symbol}; tried {', '.join(tried)}"
+    )
+
+
 def _interrupt_init(signum: int, frame: Any) -> None:  # pragma: no cover - signal path
-    """SIGTERM handler mirroring upstream ``api_server._interrupt_init``.
+    """SIGTERM handler mirroring upstream ``run_server``'s ``_interrupt_init``.
 
     Translates SIGTERM into a KeyboardInterrupt so the uvloop event loop
     unwinds cleanly via the same path as Ctrl-C.
@@ -69,9 +102,13 @@ def build_gonka_app(
     ``include_router`` -- the exact path the seam avoids because FastAPI's
     ``_IncludedRouter`` breaks prometheus route-name lookup.
 
+    An engine build whose ``build_app`` already installed a gate (the 0.28 and
+    0.30 residuals set ``app.state.gonka_gate`` and add the middleware there)
+    is left untouched: a second middleware would gate the same routes twice
+    and the router would toggle a gate the middleware does not read.
+
     Args:
-        app: the FastAPI instance returned by
-            ``vllm.entrypoints.openai.api_server.build_app(args, ...)``.
+        app: the FastAPI instance returned by ``build_app(args, ...)``.
         gate: the shared :class:`PoCGate` flag toggled by the PoC router.
         blocked_prefixes: optional override for the path prefixes the gating
             middleware 503s while PoC is active. ``None`` uses
@@ -80,6 +117,15 @@ def build_gonka_app(
     Returns:
         The same ``app`` instance (mutated). Returned for chainability.
     """
+    existing = getattr(app.state, "gonka_gate", None)
+    if existing is not None:
+        logger.info(
+            "gonka-vllm-serve: build_app already installed the PoC gate (%s); "
+            "not installing a second one",
+            type(existing).__name__,
+        )
+        return app
+
     # State for both the gating middleware AND the PoC router to read.
     app.state.gonka_gate = gate
 
@@ -100,34 +146,72 @@ def build_gonka_app(
     return app
 
 
-async def _run_server(args: Any) -> None:
-    """Async body equivalent to ``vllm.entrypoints.openai.api_server.run_server``,
-    but inserting PoC composition between ``build_app`` and ``serve_http``.
+def _import_parser_plugins(args: Any) -> None:
+    """Mirror upstream ``run_server_worker``: load ``--tool-parser-plugin`` and
+    ``--reasoning-parser-plugin`` before the app is built (0.28+ flags; absent
+    on older argparsers, hence ``getattr``)."""
+    tool_plugin = getattr(args, "tool_parser_plugin", None)
+    if tool_plugin and len(tool_plugin) > 3:
+        from vllm.tool_parsers import ToolParserManager
 
-    Mirrors v0.23.0 ``api_server.py:559-604`` (``build_and_serve``).
+        ToolParserManager.import_tool_parser(tool_plugin)
+    reasoning_plugin = getattr(args, "reasoning_parser_plugin", None)
+    if reasoning_plugin and len(reasoning_plugin) > 3:
+        from vllm.reasoning import ReasoningParserManager
+
+        ReasoningParserManager.import_reasoning_parser(reasoning_plugin)
+
+
+async def _run_server(args: Any) -> None:
+    """Async body equivalent to upstream ``run_server`` + ``build_and_serve``,
+    but inserting PoC composition between ``build_app`` and ``init_app_state``.
+
+    Mirrors v0.30.0 ``vllm/entrypoints/launchers/api_server/entry.py``
+    (``build_and_serve`` / ``run_server_worker``).
     """
     # Deferred imports: keep ``gonka-vllm-serve --help`` fast and isolated
     # from CUDA fork issues.
     import vllm.envs as envs
-    from vllm.entrypoints.openai.api_server import (
-        build_app,
-        build_async_engine_client,
-        init_app_state,
-        setup_server,
-    )
-    from vllm.entrypoints.launcher import serve_http
 
-    # Best-effort: upstream pulls this from
-    # ``vllm.entrypoints.serve.utils.server_utils`` to honour
-    # ``--log-config-file`` / ``--disable-access-log-for-endpoints``. If the
-    # internal module path moves in a future vLLM release, fall back to None
-    # (uvicorn defaults) rather than crashing serve.
+    setup_server = _resolve(
+        "setup_server",
+        "vllm.entrypoints.launchers.launcher",
+        "vllm.entrypoints.openai.api_server",
+    )
+    serve_http = _resolve(
+        "serve_http",
+        "vllm.entrypoints.launchers.launcher",
+        "vllm.entrypoints.launcher",
+    )
+    build_async_engine_client = _resolve(
+        "build_async_engine_client",
+        "vllm.entrypoints.launchers.api_server.entry",
+        "vllm.entrypoints.openai.api_server",
+    )
+    build_app = _resolve(
+        "build_app",
+        "vllm.entrypoints.launchers.app",
+        "vllm.entrypoints.openai.api_server",
+    )
+    init_app_state = _resolve(
+        "init_app_state",
+        "vllm.entrypoints.launchers.api_server.app_state",
+        "vllm.entrypoints.openai.api_server",
+    )
+
+    # Best-effort: honours ``--log-config-file`` /
+    # ``--disable-access-log-for-endpoints``. If the internal module path
+    # moves again, fall back to None (uvicorn defaults) rather than crashing.
     try:
-        from vllm.entrypoints.serve.utils.server_utils import (  # type: ignore[import-not-found]
-            get_uvicorn_log_config,
+        get_uvicorn_log_config = _resolve(
+            "get_uvicorn_log_config",
+            "vllm.entrypoints.launchers.utils.server_utils",
+            "vllm.entrypoints.serve.utils.server_utils",
         )
-    except Exception:  # pragma: no cover - vllm internal layout drift
-        get_uvicorn_log_config = None  # type: ignore[assignment]
+    except ImportError:  # pragma: no cover - vllm internal layout drift
+        get_uvicorn_log_config = None
+
+    _import_parser_plugins(args)
 
     listen_address, sock = setup_server(args, reuse_port=False)
 
@@ -138,11 +222,11 @@ async def _run_server(args: Any) -> None:
         # Stock vLLM app + middleware/handlers.
         app = build_app(args, supported_tasks, model_config)
 
-        # Gonka composition: PoC router + gating middleware.
-        gate = PoCGate()
+        # Gonka composition: gating middleware (a no-op when the engine build
+        # installed the gate inside build_app).
         build_gonka_app(
             app,
-            gate=gate,
+            gate=PoCGate(),
             blocked_prefixes=getattr(args, "gonka_poc_block_prefixes", None),
         )
 
@@ -152,12 +236,12 @@ async def _run_server(args: Any) -> None:
         # serve_http triggers).
         await init_app_state(engine_client, app.state, args, supported_tasks)
 
-        # Mirror upstream ``build_and_serve`` (v0.23.0 api_server.py:586-602).
-        # Every kwarg upstream forwards MUST be forwarded here too -- missing
-        # any of these silently drops user-supplied TLS / HTTP-limit / log
-        # config flags. ``getattr(args, "...", None)`` keeps us robust to
-        # upstream argparse changes: a removed flag falls back to None, which
-        # ``serve_http`` already tolerates.
+        # Mirror upstream ``build_and_serve``. Every kwarg upstream forwards
+        # MUST be forwarded here too -- missing any of these silently drops
+        # user-supplied TLS / HTTP-limit / log config flags.
+        # ``getattr(args, "...", None)`` keeps us robust to upstream argparse
+        # changes: a removed flag falls back to None, which ``serve_http``
+        # already tolerates.
         log_config = None
         if get_uvicorn_log_config is not None:
             try:
@@ -187,6 +271,7 @@ async def _run_server(args: Any) -> None:
         if log_config is not None:
             serve_http_kwargs["log_config"] = log_config
 
+        logger.info("gonka-vllm-serve: starting on %s", listen_address)
         # Hand off to uvicorn via the stock launcher.
         shutdown_task = await serve_http(app, **serve_http_kwargs)
         await shutdown_task
@@ -197,37 +282,37 @@ async def _run_server(args: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     """``gonka-vllm-serve`` entry point.
 
-    Mirrors v0.23.0 ``api_server.py:__main__`` (L693-703) but routes through
+    Mirrors upstream ``api_server`` ``main`` but routes through
     :func:`_run_server` so we own the composition step.
     """
     # Deferred to avoid pulling vllm at --help time on a system without it.
-    from vllm.entrypoints.openai.cli_args import (
-        make_arg_parser,
-        validate_parsed_serve_args,
+    make_arg_parser = _resolve(
+        "make_arg_parser",
+        "vllm.entrypoints.launchers.cli_args",
+        "vllm.entrypoints.openai.cli_args",
+    )
+    validate_parsed_serve_args = _resolve(
+        "validate_parsed_serve_args",
+        "vllm.entrypoints.launchers.cli_args",
+        "vllm.entrypoints.openai.cli_args",
     )
     # ``FlexibleArgumentParser`` moved out of the flat ``vllm/utils.py`` module
     # into ``vllm.utils.argparse_utils`` in v0.22.0+ and is NOT re-exported from
-    # the ``vllm.utils`` package ``__init__.py``. Try the canonical location
-    # first, fall back to the legacy flat path for older wheels or any future
-    # re-export. Mirrors the ``cli_env_setup`` try/except pattern below.
-    try:
-        from vllm.utils.argparse_utils import FlexibleArgumentParser
-    except ImportError:  # pragma: no cover - legacy/future re-export fallback
-        from vllm.utils import FlexibleArgumentParser  # type: ignore[no-redef]
+    # the ``vllm.utils`` package ``__init__.py``.
+    FlexibleArgumentParser = _resolve(
+        "FlexibleArgumentParser", "vllm.utils.argparse_utils", "vllm.utils"
+    )
 
     # ``cli_env_setup`` MUST run before we hand off to uvloop. Upstream calls
-    # it at the very top of ``vllm/entrypoints/openai/api_server.py:__main__``
-    # (v0.23.0 L697) to set ``VLLM_WORKER_MULTIPROC_METHOD=spawn`` (default is
-    # ``fork``). Skipping it crashes TP>1 / PP>1 launches with the classic
-    # CUDA-in-forked-process error -- our gonka-vllm-serve entry was missing
-    # this call entirely. Import path on v0.23.0:
-    # ``vllm.entrypoints.serve.utils.api_utils.cli_env_setup``.
+    # it at the top of its ``main`` to set ``VLLM_WORKER_MULTIPROC_METHOD=spawn``
+    # (default is ``fork``). Skipping it crashes TP>1 / PP>1 launches with the
+    # classic CUDA-in-forked-process error.
     try:
-        from vllm.entrypoints.serve.utils.api_utils import (  # type: ignore[import-not-found]
-            cli_env_setup,
+        cli_env_setup = _resolve(
+            "cli_env_setup", "vllm.entrypoints.serve.utils.api_utils"
         )
-    except Exception:  # pragma: no cover - upstream layout drift fallback
-        cli_env_setup = None  # type: ignore[assignment]
+    except ImportError:  # pragma: no cover - upstream layout drift fallback
+        cli_env_setup = None
 
     if cli_env_setup is not None:
         cli_env_setup()
@@ -264,14 +349,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     validate_parsed_serve_args(args)
 
-    # Mirror upstream ``api_server.run_server``: translate SIGTERM into the
-    # same shutdown path as Ctrl-C so the event loop unwinds the engine
-    # cleanly instead of being torn down mid-step.
+    # Mirror upstream ``run_server``: translate SIGTERM into the same shutdown
+    # path as Ctrl-C so the event loop unwinds the engine cleanly instead of
+    # being torn down mid-step.
     signal.signal(signal.SIGTERM, _interrupt_init)
 
-    # uvloop.run is the upstream parity choice (matches
-    # ``vllm.entrypoints.openai.api_server.__main__``). Deferred so the
-    # ``--help`` path stays light on a system without uvloop.
+    # uvloop.run is the upstream parity choice. Deferred so the ``--help``
+    # path stays light on a system without uvloop.
     import uvloop  # type: ignore[import-not-found]
 
     try:

@@ -32,6 +32,13 @@ vllm serve <model>
 ```
 
 Boot log confirms: `PoC implementation: gonka_poc... (plugin)`.
+
+vLLM 0.30.0 (one line for MiniMax-M2.7, DeepSeek-V4-Flash and GLM-5.3-Flash):
+`pip install vllm==0.30.0`, the engine residual of `kaitakuai/vllm` branch
+`poc-as-chat-vllm-0.30.0-dev` (proposed for `gonka-ai/vllm` `release/v0.30.0-decode-int`),
+then `pip install --no-deps -e .`. The compat shim is selected by the installed vLLM minor
+(`src/gonka_poc/_compat/`).
+
 PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 
 ## Known issues

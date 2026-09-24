@@ -3,6 +3,20 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-24 — vLLM 0.30.0: one plugin and one engine residual for the three models
+
+The decode-PoC release targets vLLM v0.30.0 (tag `ced6857af`), which carries GLM-5.3-Flash
+officially; the `release/v0.28.0-glm53` engine line is retired. `decode-poc-glm53` (it differs
+from `decode-poc-int` only in the GLM multimodal-wrapper layer lookup) is merged onto
+`decode/vlm030` (main v0.1.6): one plugin for MiniMax-M2.7, DeepSeek-V4-Flash and GLM-5.3-Flash.
+0.30 needs `_compat/v0_30.py` (`CommonAttentionMetadata` lost `_seq_lens_cpu` and
+`_num_computed_tokens_cpu`, gained `is_prefilling`), dispatch `(0, 30)`, `vllm<0.31`, and
+`gonka-vllm-serve` resolving the symbols that moved to `vllm.entrypoints.launchers.*`. The
+engine residual installs the PoC gate inside `build_app`, so the entry point no longer adds a
+second one. Engine side: `kaitakuai/vllm` branch `poc-as-chat-vllm-0.30.0-dev`, the
+gonka-ai/vllm#113 residual on v0.30.0 plus two hunks from #100 (no prefix-cache read for PoC
+rows; the executor dequeues every rank before raising). Version 0.2.0. Not yet run on hardware.
+
 ## 2026-09-07 — One ladder base (100) for every model; MiniMax reference corpora to be re-taken
 
 The seeded-routing ladder base was a per-model constant (100 on DeepSeek-V4, 0 elsewhere)
