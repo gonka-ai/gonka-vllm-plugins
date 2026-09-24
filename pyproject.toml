@@ -36,10 +36,6 @@ test = [
   "pytest>=7",
   "pytest-asyncio",
   "httpx",
-  # Runtime deps duplicated for clarity — Gate-3 (tests/unit/test_exception_paths.py)
-  # uses pytest.importorskip("scipy"), which silently skips if scipy is absent.
-  # Listing them here makes `pip install -e .[test]` fail-fast on a broken env
-  # instead of producing CI-green with zero exception-path coverage.
   "scipy>=1.10",
   "aiohttp>=3.9",
 ]
@@ -57,6 +53,9 @@ gonka_poc = "gonka_poc.plugin:register"
 
 [project.scripts]
 gonka-vllm-serve = "gonka_poc.entrypoint.api_router:main"
+
+[tool.setuptools.package-data]
+"gonka_poc.poc" = ["sphere_codebook.pt"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
