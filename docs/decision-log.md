@@ -3,6 +3,24 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-25 — GLM-5.3-Flash on vLLM 0.30: pin the 0.28.1 prefill kernels instead of re-taking the artifacts
+
+vLLM 0.30 changes two prefill paths of GLM-5.3-Flash: FlashKDA replaces the Triton
+chunked kernel in the 34 KDA layers, and the sparse-MLA layers get a dense bf16 MHA
+prefill (0.28.1 had no prefill backend for the model's MLA dimensions and ran prefill
+through the fp8-KV MQA kernel). PoC validation is a teacher-forced prefill, so a 0.30
+validator with the defaults sees the 0.28.1 reference artifacts at the cross-hardware
+level (8×H100: 12.7 % of points against 9.9 % for the 0.28.1 stack; 2×B300: 14.5 %, with
+the worst hash over the fleet thresholds). With `--kda-prefill-backend triton` and
+`--attention-config '{"sparse_mla_force_mqa": true}'` the 0.30 validator matches the
+0.28.1 one on every hash (H100 9.9 %, B300 6.5 %). PoC throughput is unchanged within
+boot noise; chat is 8 % slower on H100 and 5 % faster on B300.
+
+Decision (Kolya with Vlad, 25.09): GLM serving profiles on 0.30 carry both flags; the
+15.09 artifacts and thresholds stay. Every node runs the same setting — the two settings
+validate each other only at the cross-hardware level. The flags are engine CLI options,
+not plugin code.
+
 ## 2026-09-24 — vLLM 0.30.0: one plugin and one engine residual for the three models
 
 The decode-PoC release targets vLLM v0.30.0 (tag `ced6857af`), which carries GLM-5.3-Flash
