@@ -3,6 +3,167 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-25 — GLM-5.3-Flash on vLLM 0.30: pin the 0.28.1 prefill kernels instead of re-taking the artifacts
+
+vLLM 0.30 changes two prefill paths of GLM-5.3-Flash: FlashKDA replaces the Triton
+chunked kernel in the 34 KDA layers, and the sparse-MLA layers get a dense bf16 MHA
+prefill (0.28.1 had no prefill backend for the model's MLA dimensions and ran prefill
+through the fp8-KV MQA kernel). PoC validation is a teacher-forced prefill, so a 0.30
+validator with the defaults sees the 0.28.1 reference artifacts at the cross-hardware
+level (8×H100: 12.7 % of points against 9.9 % for the 0.28.1 stack; 2×B300: 14.5 %, with
+the worst hash over the fleet thresholds). With `--kda-prefill-backend triton` and
+`--attention-config '{"sparse_mla_force_mqa": true}'` the 0.30 validator matches the
+0.28.1 one on every hash (H100 9.9 %, B300 6.5 %). PoC throughput is unchanged within
+boot noise; chat is 8 % slower on H100 and 5 % faster on B300.
+
+Decision (Kolya with Vlad, 25.09): GLM serving profiles on 0.30 carry both flags; the
+15.09 artifacts and thresholds stay. Every node runs the same setting — the two settings
+validate each other only at the cross-hardware level. The flags are engine CLI options,
+not plugin code.
+
+## 2026-09-24 — vLLM 0.30.0: one plugin and one engine residual for the three models
+
+The decode-PoC release targets vLLM v0.30.0 (tag `ced6857af`), which carries GLM-5.3-Flash
+officially; the `release/v0.28.0-glm53` engine line is retired. `decode-poc-glm53` (it differs
+from `decode-poc-int` only in the GLM multimodal-wrapper layer lookup) is merged onto
+`decode/vlm030` (main v0.1.6): one plugin for MiniMax-M2.7, DeepSeek-V4-Flash and GLM-5.3-Flash.
+0.30 needs `_compat/v0_30.py` (`CommonAttentionMetadata` lost `_seq_lens_cpu` and
+`_num_computed_tokens_cpu`, gained `is_prefilling`), dispatch `(0, 30)`, `vllm<0.31`, and
+`gonka-vllm-serve` resolving the symbols that moved to `vllm.entrypoints.launchers.*`. The
+engine residual installs the PoC gate inside `build_app`, so the entry point no longer adds a
+second one. Engine side: `kaitakuai/vllm` branch `poc-as-chat-vllm-0.30.0-dev`, the
+gonka-ai/vllm#113 residual on v0.30.0 plus two hunks from #100 (no prefix-cache read for PoC
+rows; the executor dequeues every rank before raising). Version 0.2.0. Not yet run on hardware.
+
+## 2026-09-07 — One ladder base (100) for every model; MiniMax reference corpora to be re-taken
+
+The seeded-routing ladder base was a per-model constant (100 on DeepSeek-V4, 0 elsewhere)
+because the MiniMax reference cells had been frozen at 0 and a September 3 run at 100 looked
+twice as noisy — later traced to a poisoned compile cache, not to the base. A fresh
+B300 ↔ H200 campaign on MiniMax-M2.7 with corpora generated at both bases (honest on both
+boxes, QuantTrio AWQ fraud on the B300) shows the thresholds do not depend on the base:
+honest cross cells 7.5–7.6 % at either base, fraud 12.2–12.4 %, gap 4.76 → 4.79 pp,
+|z| ≤ 1.5 on every cross cell. `LADDER_BASE = 100` is now one constant for all models. The
+August MiniMax corpora (base 0) no longer apply; base-100 goldens replace them. This is a
+consensus constant of the decode scheme: sign-off by its owner is pending before release.
+
+## 2026-09-05 — PoC knobs move from CacheConfig to `--additional-config`; `poc_req_ids` dropped
+
+Seam surface, tier 1. `SchedulerOutput.poc_req_ids` was redundant: the runner bridge
+already knows every PoC row from `NewRequestData.poc_params` and now intersects its own
+registry with the step's scheduled requests. The four PoC knobs on the fork's `CacheConfig`
+had no CLI and only ever held their defaults; they are read from vLLM's public
+`--additional-config '{"gonka_poc": {...}}'` instead, same defaults. `CacheConfig` and
+`SchedulerOutput` are back to stock (residual `vllm/` diff 35 → 34 files, −40 lines). No
+behaviour change; verified on 1×B300 against the post-removal numbers of ADR-0017. Tier 2
+(PoC as an ordinary request via `SamplingParams.extra_args`, artifacts over
+`collective_rpc`) is designed but not done. See
+[ADR-0017, addendum](adr/ADR-0017-poc-scheduled-like-chat.md).
+
+## 2026-09-05 — PoC rows are scheduled like chat; the in-engine admission layer is gone
+
+The six Hopper fixes of ADR-0016 were patches inside `PoCAdmission`, the per-step PoC
+policy ported from the 0.20 in-tree branch (row cap, token share, KV headroom gate, stall
+hand-off, decode-only isolation, first-decode hold). Vlad's point held: the layer created
+the problems it solved, because a round was dumped into the scheduler in one go and then
+metered by hand. Measured on 1×B300 with the layer bypassed and the hold removed: verdict
+unchanged (DeepSeek goldens at τ=0.05 and 42 MiniMax cells within noise), PoC alone
+31.7 vs 31.8 nonce/s, PoC next to chat 84 s / 15.5 req/s vs 86 s / 10.2 with the layer
+(client window 256), no preemptions, no prev_k race even at window 1.
+
+Removed: `PoCAdmission` and four of the five scheduler hooks (one `poc_step_tokens` call
+remains: atomic PoC prefill, one token per decode step), decode-only steps, the KV
+headroom gate, `poc_share`, the fused Triton reflection, the admission diagnostics, and the
+experiment knobs. `POC_ROLLING_WINDOW`/`POC_ROLLING_REFILL` followed on 2026-09-10: a
+client-side window sized to the cudagraph capture measured identical to none at all, so
+the node's PoC concurrency is `--max-num-seqs`, set with the KV pool and the capture size.
+See [ADR-0017](adr/ADR-0017-poc-scheduled-like-chat.md).
+
+## 2026-09-04 — Consensus constants in traced code change only through source
+
+A ladder-base experiment on 1×B300 (MiniMax-M2.7: boot with `POC_LADDER_BASE=100`, then
+boots with base 0 on the same host) produced honest cross-hardware cells of 15–17% at τ=0
+instead of 8%, in both directions and across boots. Attribution and a git bisect on B300
+(probe: validate a corpus made by the old stack on the same card, plus H100 corpora)
+showed every "bad" boot loading the compiled graph and the AOT artifact from vLLM's
+cache and every "good" one compiling fresh. The forced-logits path runs inside the
+traced and captured router forward, so Dynamo bakes the ladder base into the graph; the
+compile-cache key hashes the traced source files and the config, not runtime values. A
+boot that overrides the base through the environment therefore poisons the cache for
+every later boot with the same code and batch config, which then runs the foreign base
+while logging its own. Verified with a controlled triple on a fresh cache root: the third
+boot (base 100 in the environment) loaded the base-0 graph and validated base-0 corpora at
+8%. The 16% cells were base mismatch, not hardware noise; honest MiniMax noise does not
+depend on the base.
+
+Decision: the base stays a per-model source constant (`_LADDER_BASE_BY_MODEL`) and the
+`POC_LADDER_BASE` environment override is removed (cc4507e reverted). Changing the base
+means changing the source, and the source is part of the cache key, so the graph is
+recompiled. A buffer-based variant (4a6a230, verified on B300) was reverted as
+unnecessary logic for production, where the base never changes at run time. Rule: any
+value the traced forward reads must be a source constant or a tensor buffer, never an
+environment or config value; boot provenance records the compile-cache key and whether
+the graph was loaded or compiled.
+
+The same trap applies to the diagnostic knobs that change the traced forward
+(`POC_FUSED_REFLECT`, `POC_ABLATE`, `VLLM_POC_DEBUG_TP`): a fused-off boot on a host
+with a compiled graph loaded the fused graph. The plugin now scopes `VLLM_CACHE_ROOT`
+to a sub-directory named by a hash of the non-default knob values, in every process at
+plugin load (`compile_cache.py`); defaults keep the unscoped root, so production caches
+are untouched. Knobs that change the traced forward are listed in one place there.
+
+## 2026-09-03 — Seeded-routing ladder base is per model
+
+Validating the frozen MiniMax-M2.7 reference corpora (48 corpora, 10 block hashes,
+B300 and 4×H100 validators) on this branch doubled every τ=0 cell (honest 7 → 15%,
+fraud 12 → 18%). Bisection over the plugin knobs, the batched-token budget, the
+checkpoint revision and the old stack rebuilt side by side pointed at one line:
+`LADDER_BASE = 100` in the forced router logits, added for DeepSeek-V4
+(sqrtsoftplus scoring with router bias) but applied to every model. On MiniMax it
+changes which experts win under bias, i.e. it is a consensus parameter. The base
+is now chosen at attach by `model_type`: 100 for `deepseek_v4`, 0 otherwise; with
+base 0 the MiniMax cells return to the frozen values (7.1 / 11.9 / 7.8 / 11.8 vs
+7.0 / 11.7 / 7.9 / 11.7 at τ=0). DeepSeek-V4 goldens captured on 03.09 used base
+100 and are unaffected. Rule: any change to seeding, ladder or PoC math is gated
+by the MiniMax golden regression before release.
+
+## 2026-09-03 — vLLM 0.25.1 is the release line; Hopper TP>1 needs `--no-async-scheduling`
+
+The release targets vLLM 0.25.1 only (Vlad's request), so the branch pair
+`mixed-poc-vllm-0.25.1-dev` (residual 4ebecc816 + this plugin) was verified on it.
+1×B300: PoC 27–28 nonce/s at GPU 92–95%, chat 25.3 req/s (c=512), R 1.08; corpora
+produced on 0.28 validate on 0.25.1 with 0 mismatches at τ=0.05; REAP fraud arm
+3.4% vs honest background ≤0.02%; NVFP4 boots (FLASHINFER_TRTLLM) but its prover is
+non-deterministic at ~0.01%. Mixed batches stay the default (decode-only steps cut
+chat from 13.4 to 5.0 req/s next to PoC).
+
+4×H100 (TP=4) on 0.25.1 crashes the engine (`illegal instruction`) once a PoC
+batch exceeds ~64 nonces, regardless of every plugin knob (mixed/decode-only,
+fused reflect, prefill slicing, ablated math), CUDA graph mode, stream and
+collective settings. Chat of the same shape does not crash; 0.28 does not crash.
+Root cause not located. Deploy Hopper TP>1 nodes on 0.25.1 with
+`--no-async-scheduling` (vLLM flag, node config): PoC 20.4 nonce/s at GPU 76%,
+chat 21.9 req/s, R 0.93 (vs 27.9 / 28.3 / 0.99 on 0.28 with async scheduling);
+cross-version and self validation stay at 0 mismatches (τ=0.05), but PoC next to
+live chat degrades most (PoC 1500 in 151 s with chat at 4.7 req/s, vs 102 s and
+8.3 req/s on 0.28).
+
+## 2026-09-02 — Hopper decode-PoC: admission defects fixed, fused reflection
+
+R on 4×H100 (DeepSeek-V4, vLLM 0.28) went from 0.47 to 1.07 without touching
+kernels, TP or the PoC math. The hang above ~160 nonces was a livelock of the
+decode-only-step rule; the low R was a per-step cap of 134 rows computed from a KV
+formula that misreads hybrid KV block sizes. Six admission defects fixed, one
+Triton kernel added. Mixed batches became the default on 03.09 (the
+earlier decode-only-step advantage next to live chat came from an admission scan
+that bypassed the isolation); `POC_MIXED_BATCH=0` (renamed from `POC_CHAT_LIKE` on 2026-09-03) restores decode-only steps. Verdict unchanged in every
+corpus↔engine combination (0 at τ=0.05).
+
+Pseudo token ids for hash-MoE stay and are always on; token-id-routed models
+remain an explicit allow-list with a loud refusal for unknown ones (03.09).
+
+See [ADR-0016](adr/ADR-0016-hopper-admission-and-fused-reflection.md).
+
 ## 2026-07-24 — First tag cut: `v0.1.0a0`
 
 The repository had no tags, so every downstream consumer pinned either a branch

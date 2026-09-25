@@ -1,29 +1,17 @@
-"""Compat shim for vLLM 0.25.x.
+"""Compat shim for vLLM 0.30.x, checked against tag ced6857af.
 
-Every function below touches a vLLM private surface. Each docstring records:
-  * the upstream symbol (with file path + line if stable);
-  * the version constraint we're claiming;
-  * the contract-test reference that must stay green.
+Copied from ``v0_28.py``. Every private surface below exists in 0.30 with the
+same name and shape except ``CommonAttentionMetadata``: ``_seq_lens_cpu`` and
+``_num_computed_tokens_cpu`` are gone (0.30 derives the computed-token count
+from ``seq_lens`` and the query lengths) and ``is_prefilling`` is new; some
+builders index it without a ``None`` check, so the shim fills it.
 
-If any of these shift in a future vLLM minor, copy this file to
-``v0_26.py``, edit the relevant function, and register the new dispatch
-mapping in ``gonka_poc/_compat/__init__.py``.
-
-CommonAttentionMetadata import-path policy
-------------------------------------------
-v0.25 REVERSED the two paths relative to v0.23:
-
-  * ``vllm.v1.attention.backend``       — canonical declaration site
-    (class at vllm/v1/attention/backend.py:395 in v0.25.1).
-  * ``vllm.v1.attention.backends.utils`` — convenience re-export
-    (utils.py:33 imports from backend).
-
-We import from the canonical ``vllm.v1.attention.backend`` path because that
-is the one pinned by
-``tests/contract/test_api_surface.py::test_common_attention_metadata_fields``
-(shim and contract test must reference the declaration site; otherwise an
-upstream re-export removal would break the shim silently while the contract
-test stays green).
+Each function records the upstream symbol and the version constraint. Line
+numbers in the docstrings come from 0.25.1 and were not re-verified. When a
+surface moves in a later minor, copy this file to ``v0_31.py`` and register it
+in ``gonka_poc/_compat/__init__.py``. ``CommonAttentionMetadata`` is imported
+from its declaration site, ``vllm.v1.attention.backend`` (backend.py:385 in
+v0.30.0).
 """
 from __future__ import annotations
 
@@ -55,47 +43,29 @@ def build_common_attention_metadata(
     _seq_lens_cpu: Optional[Any] = None,
     _num_computed_tokens_cpu: Optional[Any] = None,
     positions: Optional[Any] = None,
+    is_prefilling: Optional[Any] = None,
 ) -> Any:
     """Construct a ``CommonAttentionMetadata`` for a PoC forward pass.
 
     Upstream symbol: ``vllm.v1.attention.backend.CommonAttentionMetadata``
-        (declaration at vllm/v1/attention/backend.py:395 in v0.25.1;
-        re-exported via ``vllm.v1.attention.backends.utils``; private;
-        carries ``seq_lens_cpu_upper_bound`` for MLA-style backends and the
-        optional ``positions`` field — in v0.25.1 read by the DeepSeek-V4
-        C128A sparse-MLA builder and the SWA compressor, ``None``-safe for
-        every other backend).
+        (vllm/v1/attention/backend.py:385 in v0.30.0; private).
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.30.*
 
-    Contract test:
-        tests/contract/test_api_surface.py::test_common_attention_metadata_fields
-
-    The kwarg list mirrors the fork's ``_create_v1_attn_metadata`` call site at
-    ``vllm/poc/poc_model_runner.py`` (branch mb/feat/port-pocv2-vllm-0.23.0):
-
-        CommonAttentionMetadata(
-            query_start_loc=...,
-            query_start_loc_cpu=...,
-            seq_lens=...,
-            num_reqs=batch_size,
-            num_actual_tokens=batch_size * seq_len,
-            max_query_len=seq_len,
-            max_seq_len=seq_len,
-            block_table_tensor=...,
-            slot_mapping=...,
-            causal=True,
-            _seq_lens_cpu=...,
-            seq_lens_cpu_upper_bound=...,
-            _num_computed_tokens_cpu=torch.zeros(batch_size, ...),
-        )
-
-    Caller (poc_model_runner) is responsible for building the GPU/CPU tensors;
-    this helper is the version-pinned constructor binding only.
+    Same kwargs as the 0.28 shim, so ``poc_model_runner`` is unchanged.
+    ``_num_computed_tokens_cpu`` and ``_seq_lens_cpu`` no longer exist on the
+    dataclass and are ignored: 0.30 computes ``seq_lens - query_lens`` itself
+    (zero for an atomic PoC prefill, the value the caller passes) and builders
+    take ``seq_lens_cpu_upper_bound``. ``is_prefilling`` defaults to a CPU bool
+    tensor of ones: a PoC prefill row is prefilling, and the KDA and Mamba
+    builders index the field without a ``None`` check.
     """
-    # Import from the v0.25 canonical declaration site (backend.py) to keep
-    # the contract test's pin point authoritative.
     from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    if is_prefilling is None:
+        import torch
+
+        is_prefilling = torch.ones(int(num_reqs), dtype=torch.bool)
 
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
@@ -109,9 +79,8 @@ def build_common_attention_metadata(
         slot_mapping=slot_mapping,
         causal=causal,
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-        _seq_lens_cpu=_seq_lens_cpu,
-        _num_computed_tokens_cpu=_num_computed_tokens_cpu,
         positions=positions,
+        is_prefilling=is_prefilling,
     )
 
 
@@ -150,10 +119,7 @@ def build_attn_metadata_per_group(
         * ``builder.build(common_prefix_len, common_attn_metadata)`` — the v1
           entry point for materialising backend-specific metadata.
 
-    Version constraint: vllm == 0.25.*
-
-    Contract test:
-        tests/contract/test_api_surface.py::test_kv_caches_attribute
+    Version constraint: vllm == 0.30.*
         (covers the GPUModelRunner declaration site; attn_groups lives in
         the same class so any reshuffle that breaks one breaks the other)
 
@@ -212,10 +178,7 @@ def get_kv_cache_pool(model_runner: Any) -> list:
     Upstream symbol: ``GPUModelRunner.kv_caches`` (list[torch.Tensor])
         declared at vllm/v1/worker/gpu_model_runner.py:550 (v0.25.1).
 
-    Version constraint: vllm == 0.25.*
-
-    Contract test:
-        tests/contract/test_api_surface.py::test_kv_caches_attribute
+    Version constraint: vllm == 0.30.*
 
     The PoC forward reuses blocks starting at index 1 as scratch space; the
     99a372d4e fork commit ("safer kv cache reuse") added dtype/contiguity
@@ -280,10 +243,7 @@ async def abort_all_requests(engine_client: Any) -> int:
     Upstream symbol: ``vllm.engine.protocol.EngineClient.abort`` (ABC method;
         ``async def abort(request_id: str | Iterable[str]) -> None``).
 
-    Version constraint: vllm == 0.25.*
-
-    Contract test:
-        tests/contract/test_api_surface.py::test_engine_client_has_abort
+    Version constraint: vllm == 0.30.*
 
     Returns: number of requests aborted (best-effort).
 
@@ -381,10 +341,7 @@ def install_engine_core_poc_methods() -> bool:
     Because the block-id namespace is pool-global, ONE lease reserves the
     id's byte range in EVERY group's tensors simultaneously.
 
-    Version constraint: vllm == 0.25.*
-
-    Contract test:
-        tests/contract/test_api_surface.py::test_kv_block_pool_borrow_surface
+    Version constraint: vllm == 0.30.*
     """
     try:
         from vllm.v1.engine.core import EngineCore
@@ -467,7 +424,7 @@ async def borrow_poc_blocks(
     fails (callers treat it as feature-unavailable and fall back);
     returns ``None`` when the pool is merely busy.
 
-    Version constraint: vllm == 0.25.*
+    Version constraint: vllm == 0.30.*
     """
     parallel = getattr(
         getattr(engine_client, "vllm_config", None), "parallel_config", None)

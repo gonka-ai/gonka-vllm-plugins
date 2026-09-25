@@ -65,6 +65,7 @@ def _detect_vllm_version() -> Tuple[int, ...]:
 _DISPATCH: Mapping[Tuple[int, int], str] = {
     (0, 25): "gonka_poc._compat.v0_25",
     (0, 28): "gonka_poc._compat.v0_28",
+    (0, 30): "gonka_poc._compat.v0_30",
 }
 
 

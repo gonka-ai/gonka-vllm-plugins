@@ -1,8 +1,15 @@
 """Compat shim for vLLM 0.28.x.
 
-Copy of ``v0_25.py``: every private surface it touches exists on the
-GLM-5.3-Flash base under the same name and shape. Line numbers in the
-docstrings below are from 0.25.1.
+Copied from ``v0_25.py`` for the GLM-5.3-Flash base. Every private surface the
+0.25 shim depends on was checked against that base and is still present with
+the same name and shape: ``CommonAttentionMetadata`` (every field this shim
+passes), ``GPUModelRunner.kv_caches``, ``EngineCore`` with ``self.scheduler``,
+``Scheduler.kv_cache_manager``, ``KVCacheManager.block_pool``, ``BlockPool``'s
+``get_new_blocks``/``free_blocks``/``get_num_free_blocks``, and the
+``output_processor.request_states`` hook on ``AsyncLLM``.
+
+The FILE PATHS in the docstrings below still hold; the LINE NUMBERS are
+inherited from 0.25.1 and were not re-verified — treat them as historical.
 
 Every function below touches a vLLM private surface. Each docstring records:
   * the upstream symbol (with file path + line if stable);
@@ -221,7 +228,7 @@ def get_kv_cache_pool(model_runner: Any) -> list:
     Contract test:
         tests/contract/test_api_surface.py::test_kv_caches_attribute
 
-    The PoC forward reuses blocks starting at index 0 as scratch space; the
+    The PoC forward reuses blocks starting at index 1 as scratch space; the
     99a372d4e fork commit ("safer kv cache reuse") added dtype/contiguity
     checks. That logic lives in gonka_poc.poc.poc_model_runner; this helper
     is just the access point.
