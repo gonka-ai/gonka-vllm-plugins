@@ -1,23 +1,33 @@
-"""Live integration tests: PoC (Proof of Computation).
+"""Live integration tests: decode-PoC (the only scheme of this release).
 
 Requires a running vLLM server on port 18199.
 
 Tests:
-  1. PoC /generate with wait=true returns artifacts
-  2. PoC self-validation: generate twice with same params, L2 distance < 0.2
-  3. PoC generate with different block_hash produces different vectors
-  4. PoC batch generation (multiple nonces at once)
-  5. PoC /generate with validation block (server-side L2 check)
+  1. /generate wait=true returns k-trajectories (max_tokens+1 snaps per nonce)
+  2. Wire-form self-validation (validation.artifacts[].k_points_steps) is honest
+  3. Different block_hash -> different k-trajectories
+  4. Batch generation covers every requested nonce exactly once
+  5. A tampered reference is fraud: the nonce-level margin test catches it
+  6. max_tokens=0 degenerates to a single prefill snap through the same loop
+  7. A validation request without a reference trajectory is refused
+
+The verdict is the prefill binomial over nonces; a nonce mismatches when the
+validator disagreed on a step with snap margin above stat_test.dist_threshold
+(tau). Boundary flips on non-deterministic hardware sit below tau, so an honest
+reference is not required to give 0 raw disagreements — only no fraud verdict.
 """
-import base64
-import struct
 import httpx
 import pytest
-import numpy as np
 
 from tests.gonka.live_conftest import BASE_URL, MODEL, require_server, stop_poc
 
-POC_PARAMS = {"model": MODEL, "seq_len": 64, "k_dim": 12}
+# Small profile: fast on any single GPU.
+POC_PARAMS = {"model": MODEL, "seq_len": 64, "k_dim": 12,
+              "scheme": "decode", "max_tokens": 16}
+
+# The chain's stat_test for a decode model: tau as dist_threshold.
+STAT_TEST = {"dist_threshold": 0.025, "p_mismatch": 0.1, "fraud_threshold": 0.05}
+
 POC_BASE = {
     "block_hash": "TEST_BLOCK",
     "block_height": 100,
@@ -36,146 +46,112 @@ def server_ready():
 
 
 def poc_generate(nonces, block_hash="TEST_BLOCK", wait=True, batch_size=4,
-                 validation=None, timeout=60):
+                 validation=None, enforced_k_steps=None, params=None,
+                 stat_test=None, timeout=300):
     body = {
         **POC_BASE,
         "block_hash": block_hash,
         "nonces": nonces,
-        "params": POC_PARAMS,
+        "params": params or POC_PARAMS,
         "batch_size": batch_size,
         "wait": wait,
     }
     if validation:
         body["validation"] = validation
+    if enforced_k_steps is not None:
+        body["enforced_k_steps"] = enforced_k_steps
+    if stat_test is not None:
+        body["stat_test"] = stat_test
     return httpx.post(
         f"{BASE_URL}/api/v1/pow/generate", json=body, timeout=timeout
     )
 
 
-def decode_vector(b64_str):
-    raw = base64.b64decode(b64_str)
-    n_floats = len(raw) // 2
-    return np.array(struct.unpack(f"<{n_floats}e", raw), dtype=np.float32)
+def _trajectories(response):
+    arts = response.json()["artifacts"]
+    return {a["nonce"]: a["k_points_steps"] for a in arts}
 
 
-def l2_distance(v1, v2):
-    return float(np.linalg.norm(v1 - v2))
+def _validation(traj):
+    """The wire form the validator receives: one artifact per nonce."""
+    return {"artifacts": [{"nonce": n, "vector_b64": "", "k_points_steps": t}
+                          for n, t in traj.items()]}
 
 
-class TestPoC:
+class TestDecodePoC:
 
-    def test_01_generate_nonces(self):
-        """Generate PoC artifacts with wait=true."""
+    def test_01_generate_returns_trajectories(self):
+        """wait=true returns a full k-trajectory per nonce."""
         r = poc_generate(nonces=[0, 1, 2, 3])
         assert r.status_code == 200, f"Generate failed: {r.text}"
-        data = r.json()
-        assert data["status"] == "completed"
-        assert len(data["artifacts"]) == 4
+        traj = _trajectories(r)
+        assert set(traj) == {0, 1, 2, 3}
+        want_len = POC_PARAMS["max_tokens"] + 1
+        for nonce, k_steps in traj.items():
+            assert len(k_steps) == want_len, (nonce, len(k_steps))
+            assert all(0 <= k < 16 for k in k_steps), (nonce, k_steps[:5])
+        enc = r.json()["encoding"]
+        assert enc["k_dim"] == POC_PARAMS["k_dim"]
+        assert (enc["dtype"], enc["endian"]) == ("f16", "le")
 
-        for art in data["artifacts"]:
-            assert len(art["vector_b64"]) > 0
-            vec = decode_vector(art["vector_b64"])
-            print(f"\n  Nonce {art['nonce']}: shape={vec.shape}, norm={np.linalg.norm(vec):.4f}")
-            assert vec.shape[0] > 0
-            assert np.all(np.isfinite(vec)), f"Nonce {art['nonce']} contains NaN/Inf"
+    def test_02_self_validation_honest(self):
+        """Wire-form validation of our own trajectories is not fraud, and the
+        verdict carries one trial per nonce like the prefill flow."""
+        gen = poc_generate(nonces=[0, 1, 2, 3])
+        assert gen.status_code == 200
+        traj = _trajectories(gen)
+        val = poc_generate(nonces=[0, 1, 2, 3], validation=_validation(traj),
+                           stat_test=STAT_TEST)
+        assert val.status_code == 200, val.text
+        data = val.json()
+        assert data["n_total"] == 4
+        assert data["fraud_detected"] is False, data
+        assert len(data["per_nonce"]) == 4
+        for p in data["per_nonce"]:
+            assert p["n_steps"] == POC_PARAMS["max_tokens"] + 1, p
+            assert p["n_sphere_mismatches"] >= 0, p   # a reference was compared
 
-    def test_02_self_validation_small_distance(self):
-        """Generate same nonces twice → L2 distance should be < 0.2 (deterministic)."""
-        nonces = [42, 43, 44, 45]
-        r1 = poc_generate(nonces=nonces)
-        assert r1.status_code == 200
-        r2 = poc_generate(nonces=nonces)
-        assert r2.status_code == 200
-
-        arts1 = {a["nonce"]: a for a in r1.json()["artifacts"]}
-        arts2 = {a["nonce"]: a for a in r2.json()["artifacts"]}
-        for nonce in nonces:
-            v1 = decode_vector(arts1[nonce]["vector_b64"])
-            v2 = decode_vector(arts2[nonce]["vector_b64"])
-            dist = l2_distance(v1, v2)
-            print(f"\n  Nonce {nonce}: L2 distance={dist:.6f}, dims={v1.shape[0]}")
-            assert dist < 0.2, f"Nonce {nonce} self-validation distance too large: {dist:.4f}"
-
-    def test_03_different_block_hash_different_vectors(self):
-        """Different block_hash should produce meaningfully different vectors."""
-        r1 = poc_generate(nonces=[0, 1, 2, 3], block_hash="BLOCK_A")
-        r2 = poc_generate(nonces=[0, 1, 2, 3], block_hash="BLOCK_B")
+    def test_03_different_block_hash_different_trajectories(self):
+        r1 = poc_generate(nonces=[0])
+        r2 = poc_generate(nonces=[0], block_hash="OTHER_BLOCK")
         assert r1.status_code == 200 and r2.status_code == 200
-
-        arts1 = {a["nonce"]: a for a in r1.json()["artifacts"]}
-        arts2 = {a["nonce"]: a for a in r2.json()["artifacts"]}
-        v1 = decode_vector(arts1[0]["vector_b64"])
-        v2 = decode_vector(arts2[0]["vector_b64"])
-
-        dist = l2_distance(v1, v2)
-        print(f"\n  Different block_hash L2 distance: {dist:.6f}")
-        assert dist > 0.01, (
-            f"Different block hashes should produce different vectors, "
-            f"got distance {dist:.6f}"
-        )
+        assert _trajectories(r1)[0] != _trajectories(r2)[0]
 
     def test_04_batch_generation(self):
-        """Generate multiple nonces in a single batch."""
-        nonces = [0, 1, 2, 3]
+        nonces = list(range(8))
         r = poc_generate(nonces=nonces, batch_size=4)
-        assert r.status_code == 200, f"Batch generate failed: {r.text}"
-        data = r.json()
-        assert data["status"] == "completed"
-        assert len(data["artifacts"]) == len(nonces)
+        assert r.status_code == 200
+        traj = _trajectories(r)
+        assert set(traj) == set(nonces)
 
-        returned_nonces = {a["nonce"] for a in data["artifacts"]}
-        assert returned_nonces == set(nonces)
+    def test_05_tampered_reference_is_fraud(self):
+        """A reference with every third step moved to another cell must come
+        back as fraud on every nonce: the disagreement margins of a wrong cell
+        sit above tau, unlike boundary jitter."""
+        gen = poc_generate(nonces=[0, 1, 2, 3])
+        assert gen.status_code == 200
+        traj = _trajectories(gen)
+        tampered = {n: [(k + 1 + i % 3) % 16 if i % 3 == 0 else k
+                        for i, k in enumerate(t)]
+                    for n, t in traj.items()}
+        val = poc_generate(nonces=[0, 1, 2, 3], validation=_validation(tampered),
+                           stat_test=STAT_TEST)
+        assert val.status_code == 200, val.text
+        data = val.json()
+        assert data["fraud_detected"] is True, data
+        assert data["n_mismatch"] == 4, data
 
-        for art in data["artifacts"]:
-            vec = decode_vector(art["vector_b64"])
-            assert np.all(np.isfinite(vec)), f"Nonce {art['nonce']} has NaN/Inf"
-        print(f"\n  Batch of {len(nonces)} nonces generated successfully")
+    def test_06_prefill_only_degenerate(self):
+        """max_tokens=0: one snap per nonce through the same decode loop."""
+        params = dict(POC_PARAMS, max_tokens=0)
+        r = poc_generate(nonces=[0, 1], params=params)
+        assert r.status_code == 200, r.text
+        traj = _trajectories(r)
+        assert all(len(t) == 1 for t in traj.values())
 
-    def test_05_server_side_validation(self):
-        """Generate, then re-generate with validation block → server computes L2."""
-        r1 = poc_generate(nonces=[10, 11, 12, 13])
-        assert r1.status_code == 200
-        artifacts_a = r1.json()["artifacts"]
-
-        validation = {
-            "artifacts": [
-                {"nonce": a["nonce"], "vector_b64": a["vector_b64"]}
-                for a in artifacts_a
-            ]
-        }
-        r2 = poc_generate(nonces=[10, 11, 12, 13], validation=validation)
-        assert r2.status_code == 200, f"Validation generate failed: {r2.text}"
-        data = r2.json()
-        assert data["status"] == "completed"
-        print(f"\n  Server-side validation response: {list(data.keys())}")
-
-    def test_06_multiple_self_validations_all_below_threshold(self):
-        """Run 5 self-validations, mean L2 < 0.1 and max L2 < 0.3."""
-        distances = []
-        for i in range(5):
-            nonces = [i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 3]
-            r1 = poc_generate(nonces=nonces)
-            r2 = poc_generate(nonces=nonces)
-            assert r1.status_code == 200 and r2.status_code == 200
-
-            arts1 = {a["nonce"]: a for a in r1.json()["artifacts"]}
-            arts2 = {a["nonce"]: a for a in r2.json()["artifacts"]}
-            for n in nonces:
-                v1 = decode_vector(arts1[n]["vector_b64"])
-                v2 = decode_vector(arts2[n]["vector_b64"])
-                dist = l2_distance(v1, v2)
-                distances.append(dist)
-
-        mean_dist = sum(distances) / len(distances)
-        max_dist = max(distances)
-        print(f"\n  Self-validation distances ({len(distances)} pairs): "
-              f"{[f'{d:.6f}' for d in distances]}")
-        print(f"  Mean: {mean_dist:.6f}, Max: {max_dist:.6f}")
-        assert mean_dist < 0.1, (
-            f"Mean self-validation distance {mean_dist:.4f} >= 0.1. "
-            f"All: {[f'{d:.4f}' for d in distances]}"
-        )
-        assert max_dist < 0.3, (
-            f"Max self-validation distance {max_dist:.4f} >= 0.3. "
-            f"All: {[f'{d:.4f}' for d in distances]}"
-        )
+    def test_07_validation_needs_reference(self):
+        """validation.artifacts without k_points_steps is refused, never
+        answered with a vacuous honest verdict."""
+        r = poc_generate(nonces=[0], validation={"artifacts": [
+            {"nonce": 0, "vector_b64": ""}]}, stat_test=STAT_TEST)
+        assert r.status_code == 400, r.text

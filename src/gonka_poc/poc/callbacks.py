@@ -1,5 +1,6 @@
 """PoC callback sender with retry-until-stop and bounded buffer."""
 import asyncio
+import os
 import time
 from collections import deque
 from typing import Any, Dict, List, Optional
@@ -7,27 +8,30 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from vllm.logger import init_logger
-from .config import (
-    POC_CALLBACK_INTERVAL_SEC,
-    POC_CALLBACK_MAX_ARTIFACTS,
-    POC_CALLBACK_MAX_CONCURRENT,
-    POC_CALLBACK_MAX_RETRIES,
-    POC_CALLBACK_QUEUE_SIZE,
-)
-from .data import Artifact, wire_encoding
+from .data import Artifact
 
 logger = init_logger(__name__)
 
+
+def _artifact_payload(a) -> dict:
+    d = {"nonce": a.nonce, "vector_b64": a.vector_b64}
+    if a.k_points_steps is not None:
+        d["k_points_steps"] = a.k_points_steps
+    if getattr(a, "sph_values_steps", None):
+        d["sph_values_steps"] = a.sph_values_steps
+    return d
+
+POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
+POC_CALLBACK_MAX_ARTIFACTS = int(os.environ.get("POC_CALLBACK_MAX_ARTIFACTS", "1000000"))
 POC_CALLBACK_RETRY_BACKOFF_SEC = 1.0
 POC_CALLBACK_RETRY_MAX_BACKOFF_SEC = 30.0
+POC_CALLBACK_MAX_RETRIES = int(os.environ.get("POC_CALLBACK_MAX_RETRIES", "10"))
+POC_CALLBACK_MAX_CONCURRENT = int(os.environ.get("POC_CALLBACK_MAX_CONCURRENT", "10"))
+POC_CALLBACK_QUEUE_SIZE = int(os.environ.get("POC_CALLBACK_QUEUE_SIZE", "10000"))
 
 
 class CallbackSender:
-    """Manages callback sending with retry and bounded buffer.
-
-    Mining path: owned by /init/generate; streams cadence-batched artifacts
-    to {url}/generated.
-    """
+    """Manages callback sending with retry and bounded buffer."""
     
     def __init__(
         self,
@@ -44,6 +48,7 @@ class CallbackSender:
         self._buffer: deque[Artifact] = deque()
         self._metadata: Dict[str, Any] = {}
         self._pending_payload: Optional[Dict] = None
+        self._task: Optional[asyncio.Task] = None
     
     def add_artifacts(self, artifacts: List[Artifact], metadata: Dict[str, Any]):
         """Add artifacts to buffer, dropping oldest if cap exceeded."""
@@ -58,7 +63,11 @@ class CallbackSender:
         """Clear all buffered artifacts."""
         self._buffer.clear()
         self._pending_payload = None
-
+    
+    @property
+    def buffered_count(self) -> int:
+        return len(self._buffer)
+    
     async def run(self):
         """Main sender loop - batches and sends with retry-until-stop."""
         last_send_time = time.time()
@@ -83,14 +92,18 @@ class CallbackSender:
                     self._buffer.clear()
                     self._pending_payload = {
                         **self._metadata,
-                        "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts_to_send],
-                        "encoding": wire_encoding(self.k_dim),
+                        # decode PoC adds the sphere_k trajectory; the vector
+                        # window (poc_vector_artifacts/debug) adds sph_values_steps.
+                        # Absent fields leave no key, so prefill payloads stay
+                        # byte-unchanged.
+                        "artifacts": [_artifact_payload(a) for a in artifacts_to_send],
+                        "encoding": {"dtype": "f16", "k_dim": self.k_dim, "endian": "le"},
                     }
                     retry_attempt = 0
                 
                 if self._pending_payload:
                     retry_attempt += 1
-                    success = await self._send_callback(session, self._pending_payload)
+                    success = await self._send_callback(session, self._pending_payload, retry_attempt)
                     if success:
                         if retry_attempt > 1:
                             logger.info(f"Callback to {self.callback_url} succeeded after {retry_attempt} attempts")
@@ -111,7 +124,7 @@ class CallbackSender:
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, POC_CALLBACK_RETRY_MAX_BACKOFF_SEC)
     
-    async def _send_callback(self, session: aiohttp.ClientSession, payload: Dict) -> bool:
+    async def _send_callback(self, session: aiohttp.ClientSession, payload: Dict, attempt: int = 1) -> bool:
         """Send callback, return True on success."""
         try:
             async with session.post(
@@ -128,11 +141,7 @@ class CallbackSender:
 
 
 class CallbackQueue:
-    """Queue for reliable callback delivery with bounded concurrency.
-
-    Queued-/generate path: owned by GenerateQueue's worker; delivers one
-    payload per job to {url}/generated (artifacts) or {url}/validated (verdict).
-    """
+    """Queue for reliable callback delivery with bounded concurrency."""
 
     def __init__(
         self,
@@ -159,6 +168,14 @@ class CallbackQueue:
             self._dropped_count += 1
             if self._dropped_count == 1 or self._dropped_count % 100 == 0:
                 logger.warning(f"Callback queue full, dropped {self._dropped_count} callbacks total")
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._queue)
+
+    @property
+    def active_count(self) -> int:
+        return len(self._active_tasks)
 
     async def start(self):
         """Start the callback worker."""
@@ -202,11 +219,12 @@ class CallbackQueue:
                     await asyncio.sleep(0.05)
                     continue
 
-                url, path, payload = self._queue.popleft()
-                task = asyncio.create_task(
-                    self._send_with_retry(url, path, payload)
-                )
-                self._active_tasks.add(task)
+                if self._queue:
+                    url, path, payload = self._queue.popleft()
+                    task = asyncio.create_task(
+                        self._send_with_retry(url, path, payload)
+                    )
+                    self._active_tasks.add(task)
 
         except asyncio.CancelledError:
             pass

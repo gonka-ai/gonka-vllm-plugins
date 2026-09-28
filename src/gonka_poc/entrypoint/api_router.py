@@ -12,8 +12,8 @@ This is a thin wrapper around the upstream public API:
 
 We do NOT patch any vLLM source file. We only:
   1. Build the stock FastAPI app via ``build_app(args, ...)``.
-  2. Attach our PoC router (``gonka_poc.poc.routes``) via
-     ``app.include_router(...)``.
+  2. Leave the PoC router alone: ``build_app`` registers it itself in a vllm
+     build carrying the PoC engine seams.
   3. Install ``PoCGatingMiddleware`` AFTER ``build_app`` returns so it ends up
      OUTERMOST in Starlette's reverse-insertion order, gating the
      ``/v1/chat/completions`` and ``/v1/completions`` routes with 503 when PoC
@@ -55,22 +55,19 @@ def _interrupt_init(signum: int, frame: Any) -> None:  # pragma: no cover - sign
     raise KeyboardInterrupt("gonka-vllm-serve received SIGTERM")
 
 
-def attach_poc_router(app: FastAPI) -> None:
-    """Attach the PoC API router (``gonka_poc.poc.routes``)."""
-    # Imported lazily because gonka_poc.poc.* pulls vllm.logger which itself
-    # requires a configured vllm runtime.
-    from gonka_poc.poc.routes import router as poc_router
-
-    app.include_router(poc_router)
-
-
 def build_gonka_app(
     app: FastAPI,
     *,
     gate: PoCGate,
     blocked_prefixes: Optional[Iterable[str]] = None,
 ) -> FastAPI:
-    """Mutate the upstream-built FastAPI app: add PoC router + gating middleware.
+    """Mutate the upstream-built FastAPI app: add the gating middleware.
+
+    The PoC router is NOT attached here: ``build_app`` registers it itself in
+    a vllm build carrying the PoC engine seams. Attaching it again would put
+    a second copy of every ``/api/v1/pow/*`` route on the app, via
+    ``include_router`` -- the exact path the seam avoids because FastAPI's
+    ``_IncludedRouter`` breaks prometheus route-name lookup.
 
     Args:
         app: the FastAPI instance returned by
@@ -83,10 +80,6 @@ def build_gonka_app(
     Returns:
         The same ``app`` instance (mutated). Returned for chainability.
     """
-    # Router first so /api/v1/pow/* is registered on the same FastAPI as
-    # /v1/chat/completions. Both share ``app.state``.
-    attach_poc_router(app)
-
     # State for both the gating middleware AND the PoC router to read.
     app.state.gonka_gate = gate
 

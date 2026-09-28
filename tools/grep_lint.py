@@ -4,10 +4,9 @@
 Enforces two invariants on the repo:
 
   (a) Private vLLM symbols (``from vllm.v1.*`` / ``import vllm.v1.*``) MUST
-      live ONLY inside ``src/gonka_poc/_compat/``. The compat package is the
-      single, version-dispatched channel for upstream private-internals
-      touchpoints; anything else creeps the touchpoint surface and forces a
-      whole-tree audit every time a vLLM minor bumps.
+      live ONLY inside ``src/gonka_poc/mixed/`` (the engine-facing seam
+      subpackage) or under ``tests/``. Anything else creeps the touchpoint
+      surface and forces a whole-tree audit every time a vLLM minor bumps.
 
   (b) Every ``ADR-NNNN`` reference in source code / docs MUST correspond to a
       real file under ``docs/adr/`` (any extension). Stale ADR references
@@ -49,9 +48,11 @@ from typing import Iterator, List, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Anything under this prefix is the ONE blessed compat channel. Matching is
-# done on the path RELATIVE to REPO_ROOT (POSIX-normalised).
-COMPAT_PREFIX = "src/gonka_poc/_compat/"
+# Blessed prefixes for private vllm.v1.* touchpoints: the engine-facing
+# mixed subpackage, the version-dispatched _compat adapters (the channel the
+# workflow header names) and tests. Matching is done on the path RELATIVE to
+# REPO_ROOT (POSIX-normalised).
+ALLOWED_V1_PREFIXES = ("src/gonka_poc/mixed/", "src/gonka_poc/_compat/", "tests/")
 
 EXCLUDE_DIRS: Set[str] = {
     ".git",
@@ -140,7 +141,7 @@ def _file_in_scope(rel_posix: str) -> bool:
 
 
 def _is_under_compat(rel_posix: str) -> bool:
-    return rel_posix.startswith(COMPAT_PREFIX)
+    return rel_posix.startswith(ALLOWED_V1_PREFIXES)
 
 
 def _is_comment_line(line: str) -> bool:
@@ -258,7 +259,7 @@ def _scan_file(
             if not skip_for_private and RE_PRIVATE_VLLM_V1.search(raw):
                 findings.append(
                     f"{rel_posix}:{lineno}: private vllm.v1.* import outside "
-                    f"src/gonka_poc/_compat/ -- route via gonka_poc._compat.current()"
+                    f"src/gonka_poc/mixed/ or tests/"
                 )
 
         # (b) ADR-NNNN existence
