@@ -3,38 +3,6 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
-## 2026-09-25 — GLM-5.3-Flash on vLLM 0.30: pin the 0.28.1 prefill kernels instead of re-taking the artifacts
-
-vLLM 0.30 changes two prefill paths of GLM-5.3-Flash: FlashKDA replaces the Triton
-chunked kernel in the 34 KDA layers, and the sparse-MLA layers get a dense bf16 MHA
-prefill (0.28.1 had no prefill backend for the model's MLA dimensions and ran prefill
-through the fp8-KV MQA kernel). PoC validation is a teacher-forced prefill, so a 0.30
-validator with the defaults sees the 0.28.1 reference artifacts at the cross-hardware
-level (8×H100: 12.7 % of points against 9.9 % for the 0.28.1 stack; 2×B300: 14.5 %, with
-the worst hash over the fleet thresholds). With `--kda-prefill-backend triton` and
-`--attention-config '{"sparse_mla_force_mqa": true}'` the 0.30 validator matches the
-0.28.1 one on every hash (H100 9.9 %, B300 6.5 %). PoC throughput is unchanged within
-boot noise; chat is 8 % slower on H100 and 5 % faster on B300.
-
-Decision (Kolya with Vlad, 25.09): GLM serving profiles on 0.30 carry both flags; the
-15.09 artifacts and thresholds stay. Every node runs the same setting — the two settings
-validate each other only at the cross-hardware level. The flags are engine CLI options,
-not plugin code.
-
-## 2026-09-24 — vLLM 0.30.0: one plugin and one engine residual for the three models
-
-The decode-PoC release targets vLLM v0.30.0 (tag `ced6857af`), which carries GLM-5.3-Flash
-officially; the `release/v0.28.0-glm53` engine line is retired. `decode-poc-glm53` (it differs
-from `decode-poc-int` only in the GLM multimodal-wrapper layer lookup) is merged onto
-`decode/vlm030` (main v0.1.6): one plugin for MiniMax-M2.7, DeepSeek-V4-Flash and GLM-5.3-Flash.
-0.30 needs `_compat/v0_30.py` (`CommonAttentionMetadata` lost `_seq_lens_cpu` and
-`_num_computed_tokens_cpu`, gained `is_prefilling`), dispatch `(0, 30)`, `vllm<0.31`, and
-`gonka-vllm-serve` resolving the symbols that moved to `vllm.entrypoints.launchers.*`. The
-engine residual installs the PoC gate inside `build_app`, so the entry point no longer adds a
-second one. Engine side: `kaitakuai/vllm` branch `poc-as-chat-vllm-0.30.0-dev`, the
-gonka-ai/vllm#113 residual on v0.30.0 plus two hunks from #100 (no prefix-cache read for PoC
-rows; the executor dequeues every rank before raising). Version 0.2.0. Not yet run on hardware.
-
 ## 2026-09-07 — One ladder base (100) for every model; MiniMax reference corpora to be re-taken
 
 The seeded-routing ladder base was a per-model constant (100 on DeepSeek-V4, 0 elsewhere)
