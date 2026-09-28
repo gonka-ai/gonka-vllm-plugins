@@ -22,7 +22,10 @@ from gonka_poc.poc.generate_queue import (
     GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
     compute_nonce_artifacts, drain_poc,
 )
-from gonka_poc.poc.reservation import poc_reservation
+from gonka_poc.poc.reservation import (
+    poc_reservation,
+    reset_prefix_cache_after_inplace_poc,
+)
 from gonka_poc.poc.validation import run_validation
 from gonka_poc._compat import current as _compat_current
 
@@ -442,6 +445,12 @@ async def _generation_loop(
     except Exception as e:
         logger.error(f"PoC generation crashed: {e}", exc_info=True)
         raise
+    finally:
+        if not poc_decode:
+            # Prefill mining wrote blocks 1..N in place without evicting their
+            # cached hashes -- drop the prefix cache so later hits cannot serve
+            # PoC-clobbered KV (as 0.1.6 does; see reservation module docstring).
+            await reset_prefix_cache_after_inplace_poc(engine_client)
 
 
 # =============================================================================
