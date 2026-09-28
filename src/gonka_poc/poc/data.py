@@ -1,7 +1,7 @@
 """PoC data types and helpers for artifact-based validation."""
 import base64
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 from scipy.stats import binomtest
@@ -11,13 +11,23 @@ from scipy.stats import binomtest
 DEFAULT_DIST_THRESHOLD = 0.02
 DEFAULT_P_MISMATCH = 0.001
 DEFAULT_FRAUD_THRESHOLD = 0.01
+# Decode: the snap margin above which a teacher-forced disagreement counts as a
+# different computation rather than boundary jitter. Sent by the chain as
+# stat_test.dist_threshold for decode models; this is only the fallback.
+DEFAULT_MARGIN_TAU = 0.025
 
 
 @dataclass
 class Artifact:
-    """Single nonce artifact with base64-encoded vector."""
+    """Single nonce artifact. Prefill PoC carries vector_b64; decode PoC carries the
+    sphere_k trajectory (k_points_steps) and leaves vector_b64 empty."""
     nonce: int
     vector_b64: str
+    k_points_steps: Optional[List[int]] = None
+    # windowed pre-snap slices (poc_vector_artifacts) or full debug trajectory
+    sph_values_steps: Optional[List[str]] = None
+
+
 
 
 def encode_vector(vector: np.ndarray) -> str:
@@ -33,9 +43,6 @@ def decode_vector(b64: str) -> np.ndarray:
     return f16.astype(np.float32)
 
 
-def wire_encoding(k_dim: int) -> dict:
-    """Wire-protocol encoding descriptor for artifact vectors."""
-    return {"dtype": "f16", "k_dim": k_dim, "endian": "le"}
 
 
 def fraud_test(
@@ -68,3 +75,4 @@ def fraud_test(
     p_value = float(result.pvalue)
     fraud_detected = p_value < fraud_threshold
     return p_value, fraud_detected
+
