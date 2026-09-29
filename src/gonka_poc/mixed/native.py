@@ -53,13 +53,14 @@ def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tens
     return _reflect_torch(x, v, mask)
 
 
-def _install_poc_patch(module: nn.Module, wrapper: nn.Module) -> None:
+def _install_poc_patch(module: nn.Module, wrapper: nn.Module, state) -> None:
     """Class-level forward patch. torch.compile traces the CLASS forward, so
     instance ``obj.forward = ...`` assignments are ignored inside compiled
     regions (decode snaps read zeros exactly this way). The class forward
     dispatches to the instance's wrapper when present; untouched instances of
     the same class keep original behaviour. The wrapper calls the ORIGINAL
-    class forward, captured once per class."""
+    class forward, captured once per class. The wrapper runs only while
+    ``state.active`` (see PoCNativeState)."""
     import functools
 
     cls = type(module)
@@ -69,11 +70,12 @@ def _install_poc_patch(module: nn.Module, wrapper: nn.Module) -> None:
 
         def _poc_forward(self, *args, **kwargs):
             w = getattr(self, "_poc_wrap", None)
-            if w is not None:
+            if w is not None and w._st.active:
                 return w.forward(*args, **kwargs)
             return cls._poc_orig_forward(self, *args, **kwargs)
 
         cls.forward = _poc_forward
+    wrapper._st = state
     wrapper._inner_call = functools.partial(
         cls.__dict__["_poc_orig_forward"], module)
     # object.__setattr__: keep the wrapper out of nn.Module submodule
@@ -295,6 +297,12 @@ class PoCNativeState:
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.max_tokens = max_tokens
+        # Whether the wrappers run. They are exact identity for chat rows and
+        # for the prefill scheme's own forward (mask False), so the runner
+        # turns them off for forwards and cudagraphs without decode-PoC rows
+        # (PoCRunnerBridge.set_active). A compiled forward is traced once and
+        # keeps them: the flag stays True there.
+        self.active = True
         # ONE [layers, groups, hidden] table; self.table keeps the per-layer
         # entries as VIEWS into it. A group is one (block_hash[, nonce]) draw,
         # group 0 is the zero vector; rows point at their group through the
@@ -598,7 +606,8 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # layer under a wrapper breaks the compiled graph's parameter map.
     for i, layer in enumerate(layers):
         _install_poc_patch(
-            layer, PoCLayerWrapper(layer, state.table[i], state.row_group, state.mask))
+            layer, PoCLayerWrapper(layer, state.table[i], state.row_group, state.mask),
+            state)
     if embed_owner is not None and hasattr(embed_owner, "embed_tokens"):
         # Patch forward IN PLACE, never replace the module: wrapping renames
         # parameters (embed_tokens.weight -> embed_tokens.inner.weight) and
@@ -608,11 +617,11 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
             _emb, state.embeds, state.mask,
             state.embed_base, state.embed_prev_k, state.embed_step, hidden_size,
             state.poc_token_ids)
-        _install_poc_patch(_emb, _wrap)
+        _install_poc_patch(_emb, _wrap, state)
     # SNAP = SAMPLING: patch the final norm in place, same reason as above.
     if embed_owner is not None and hasattr(embed_owner, "norm"):
         _nrm = embed_owner.norm
-        _install_poc_patch(_nrm, PoCSnapWrapper(_nrm, state))
+        _install_poc_patch(_nrm, PoCSnapWrapper(_nrm, state), state)
     # Seeded-routing is MANDATORY for MoE — part of the PoC algorithm, not a toggle.
     # Natural MoE top-k reads the noise-prone hidden, so cross-HW/backend drift flips
     # the k-th expert and inflates the honest floor; seeding the experts from
@@ -650,7 +659,7 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         state.router_meta.append((n_exp, top_k))
         _gate = moe.gate
         _install_poc_patch(_gate, PoCRouterWrapper(
-            _gate, route_base, state.route_step, n_exp, top_k, state.mask))
+            _gate, route_base, state.route_step, n_exp, top_k, state.mask), state)
         # The gate-logit forcing above is the single routing seam, as in
         # 0.20. The selection override is NOT installed: replacing the
         # engine's expert weights with the ladder softmax collapses the

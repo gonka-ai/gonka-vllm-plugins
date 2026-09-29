@@ -72,6 +72,9 @@ class PoCRunnerBridge:
     def __init__(self, runner) -> None:
         self.runner = runner
         self.native = None
+        # The runner keeps a cudagraph set without the PoC transforms only for
+        # an uncompiled forward; a compiled one always runs them.
+        self.gated = False
         self._step: dict[str, Any] | None = None  # per-step mixed-batch info
         self._reqs: dict[str, _PoCRequestView] = {}
 
@@ -106,9 +109,13 @@ class PoCRunnerBridge:
         )
         # mixed_decode reads the state off the runner (0.20 contract).
         runner._poc_native = self.native
+        self.gated = bool(getattr(
+            getattr(runner, "cudagraph_dispatcher", None), "poc_graphs", False))
 
     # --------------------------------------------------------- per-step hooks
-    def pre_step(self, scheduler_output: "SchedulerOutput") -> None:
+    def pre_step(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Register this step's PoC rows; True when it has any. The runner
+        dispatches on it: only such steps run the in-model PoC transforms."""
         # The bridge keeps its own registry of PoC rows: a row is registered
         # the step it first appears (NewRequestData.poc_params) and forgotten
         # when the scheduler reports it finished. The rows of THIS step are
@@ -122,7 +129,7 @@ class PoCRunnerBridge:
             self._reqs.pop(rid, None)
         if not self._reqs:
             self._step = None
-            return
+            return self.set_active(False)
 
         poc_req_ids: set[str] = set()
         cached = scheduler_output.scheduled_cached_reqs
@@ -136,7 +143,7 @@ class PoCRunnerBridge:
                 poc_req_ids.add(r.req_id)
         if not poc_req_ids:
             self._step = None
-            return
+            return self.set_active(False)
         # Deterministic order: nonce, not set-iteration (PYTHONHASHSEED).
         poc_requests = sorted(
             (self._reqs[rid] for rid in poc_req_ids if rid in self._reqs),
@@ -149,6 +156,15 @@ class PoCRunnerBridge:
             "poc_metadata": None,
             "poc_position_mask": None,
         }
+        return self.set_active(True)
+
+    def set_active(self, active: bool) -> bool:
+        """Whether the in-model PoC transforms run in the coming forwards
+        (PoCNativeState.active); a no-op for a compiled forward. Returns
+        ``active``."""
+        if self.native is not None and self.gated:
+            self.native.active = active
+        return active
 
     def pre_forward(self, scheduler_output: "SchedulerOutput",
                     positions: torch.Tensor, num_total_tokens: int,
@@ -221,6 +237,7 @@ class PoCRunnerBridge:
         # the decode side is what sets it; the prefill files stay untouched.
         if self.native is not None:
             self.native.set_mask(None)
+        self.set_active(False)
         return out
 
     # ------------------------------------------------------ sampling exclusion
