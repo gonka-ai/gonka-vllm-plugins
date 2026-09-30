@@ -50,17 +50,21 @@ class _FakeAsyncLLM:
     def __init__(self, external_to_internal: dict[str, list[str]]) -> None:
         self.output_processor = _FakeOutputProcessor(external_to_internal)
         self.actually_aborted: list[str] = []
+        self.calls = 0
 
-    async def abort(self, request_id: str, internal: bool = False) -> None:
+    async def abort(self, request_id, internal: bool = False) -> None:
+        self.calls += 1
         op = self.output_processor
-        if internal:
-            if request_id in op.request_states:
-                self.actually_aborted.append(request_id)
-            return
-        # External path: look the id up in the external->internal map. An
-        # internal id is not a key there, so nothing is aborted -- quietly.
-        for internal_id in op.external_req_ids.get(request_id, []):
-            self.actually_aborted.append(internal_id)
+        ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        for rid in ids:
+            if internal:
+                if rid in op.request_states:
+                    self.actually_aborted.append(rid)
+                continue
+            # External path: look the id up in the external->internal map. An
+            # internal id is not a key there, so nothing is aborted -- quietly.
+            for internal_id in op.external_req_ids.get(rid, []):
+                self.actually_aborted.append(internal_id)
 
 
 def test_in_flight_requests_are_really_aborted() -> None:
@@ -73,6 +77,7 @@ def test_in_flight_requests_are_really_aborted() -> None:
         "requests were reported as aborted but never left the engine"
     )
     assert aborted == 3, "the returned count must reflect real aborts"
+    assert client.calls == 1, "all ids must go to the engine in one abort call"
 
 
 def test_client_without_internal_parameter_still_works() -> None:

@@ -330,21 +330,17 @@ async def abort_all_requests(engine_client: Any) -> int:
             type(engine_client).__name__,
         )
 
-    aborted = 0
-    for rid in request_ids:
-        try:
-            # EngineClient.abort accepts a single id or an iterable; we issue
-            # per-id calls so one bad id does not abort the rest of the loop.
-            if supports_internal:
-                await abort_fn(rid, internal=True)
-            else:
-                await abort_fn(rid)
-            aborted += 1
-        except Exception as exc:  # noqa: BLE001 -- best-effort, never raise
-            logger.warning(
-                "abort_all_requests: abort(%s) failed: %s", rid, exc
-            )
-    return aborted
+    try:
+        if supports_internal:
+            await abort_fn(request_ids, internal=True)
+        else:
+            await abort_fn(request_ids)
+    except Exception as exc:  # noqa: BLE001 -- best-effort, never raise
+        logger.warning(
+            "abort_all_requests: abort(%d ids) failed: %s", len(request_ids), exc
+        )
+        return 0
+    return len(request_ids)
 
 
 # ---------------------------------------------------------------------------- #
