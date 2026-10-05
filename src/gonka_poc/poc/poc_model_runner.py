@@ -377,19 +377,29 @@ def execute_poc_forward(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
         )
 
-    with set_forward_context(
-        attn_metadata, vllm_config,
-        num_tokens=batch_size * seq_len,
-        slot_mapping=slot_mapping_dict,
-        skip_compiled=True,
-    ):
-        with poc_forward_context():
-            hidden_states = model(
-                input_ids=poc_input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
-            )
+    # The decode-PoC wrappers are identity here (no decode rows); off for this
+    # eager forward even where a compiled model keeps them always on.
+    native = getattr(worker.model_runner, "_poc_native", None)
+    native_active = native.active if native is not None else None
+    if native is not None:
+        native.active = False
+    try:
+        with set_forward_context(
+            attn_metadata, vllm_config,
+            num_tokens=batch_size * seq_len,
+            slot_mapping=slot_mapping_dict,
+            skip_compiled=True,
+        ):
+            with poc_forward_context():
+                hidden_states = model(
+                    input_ids=poc_input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
+                )
+    finally:
+        if native is not None:
+            native.active = native_active
 
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
