@@ -69,6 +69,11 @@ POC_CHAT_BUSY_BACKOFF_SEC = 0.05
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
 # Request default when the chain sends no batch_size: 32, as in 3.0.16.
 POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
+# Decode mining starts its nonces in this many groups, this many seconds apart,
+# and replaces every finished nonce at once, so artifacts arrive in steps of a
+# group rather than of the whole round.
+POC_DECODE_GROUPS = int(os.environ.get("POC_DECODE_GROUPS", "4"))
+POC_DECODE_GROUP_DELAY_S = float(os.environ.get("POC_DECODE_GROUP_DELAY_S", "8"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 
@@ -357,6 +362,58 @@ async def _compute_artifacts_chunk(
 # Generation Loop
 # =============================================================================
 
+async def _decode_mining(engine_client, stop_event: asyncio.Event,
+                         callback_sender: Optional[CallbackSender], config: dict,
+                         stats: dict, nonce_iter: NonceIterator, batch_size: int):
+    """Decode-scheme mining without rounds. Every nonce of a round has the same
+    length, so a round started at once also finishes at once and its artifacts
+    land in one step; the window then closes on a multiple of the round. Here
+    up to ``batch_size`` nonces run at a time: the first ones start in
+    POC_DECODE_GROUPS groups POC_DECODE_GROUP_DELAY_S apart, and a finished
+    nonce is published and replaced at once, which keeps the groups apart."""
+    groups = max(1, min(POC_DECODE_GROUPS, batch_size))
+    group = -(-batch_size // groups)
+    meta = {"public_key": config["public_key"], "block_hash": config["block_hash"],
+            "block_height": config["block_height"], "node_id": config["node_id"]}
+    logger.info(f"PoC decode mining: up to {batch_size} nonces, {groups} groups "
+                f"{POC_DECODE_GROUP_DELAY_S:g}s apart")
+
+    async def one(nonce: int) -> List[Dict]:
+        return await _compute_artifacts_chunk(
+            engine_client, [nonce], config["block_hash"], config["public_key"],
+            config["seq_len"], config["k_dim"], config["poc_stronger_rng"],
+            poc_decode=True, max_tokens=config.get("max_tokens", 0),
+            block_height=config["block_height"])
+
+    t0 = time.monotonic()
+    started: set = set()
+    last_report = t0
+    try:
+        while not stop_event.is_set():
+            cap = min(batch_size, group * (1 + int((time.monotonic() - t0) / POC_DECODE_GROUP_DELAY_S)))
+            while len(started) < cap:
+                started.add(asyncio.create_task(one(next(nonce_iter))))
+            done, started = await asyncio.wait(started, timeout=0.5,
+                                               return_when=asyncio.FIRST_COMPLETED)
+            artifacts = [a for task in done for a in task.result()]
+            now = time.monotonic()
+            if artifacts and callback_sender:
+                callback_sender.add_artifacts(
+                    [Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"],
+                              k_points_steps=a.get("k_points_steps"),
+                              sph_values_steps=a.get("sph_values_steps"))
+                     for a in artifacts], meta)
+            stats["total_processed"] += len(done)
+            if now - last_report >= 5.0:
+                rate = stats["total_processed"] / ((now - t0) / 60)
+                logger.info(f"Generated: {stats['total_processed']} nonces ({rate:.0f}/min), {len(started)} in flight")
+                last_report = now
+    finally:
+        for task in started:
+            task.cancel()
+        await asyncio.gather(*started, return_exceptions=True)
+
+
 async def _generation_loop(
     engine_client,
     stop_event: asyncio.Event,
@@ -387,7 +444,10 @@ async def _generation_loop(
     pending_nonces = None
     
     try:
-        while not stop_event.is_set():
+        if poc_decode:
+            await _decode_mining(engine_client, stop_event, callback_sender, config,
+                                 stats, nonce_iter, batch_size)
+        while not poc_decode and not stop_event.is_set():
             nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
             
             try:
