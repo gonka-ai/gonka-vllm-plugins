@@ -1,17 +1,20 @@
 """Fused Triton kernels for the PoC transforms: the decode wrappers (router
 override, per-layer reflection, embedding synthesis) and the prefill
-Householder hook.
+Householder hook; and MiniMax-M2's q/k RMSNorm in the PoC forward.
 
 Each kernel computes the plugin's torch expression bit for bit: the same
 elementwise ops in the same order with the same rounding (no FMA contraction,
 IEEE division and sqrt, the libdevice log/sin/cos that PyTorch itself calls),
-and the one reduction, the reflection dot product, stays ``torch.sum``. They
+and the reflection dot product stays ``torch.sum``; the q/k RMSNorm variance
+follows torch's own reduction order. They
 only remove the launches and memory round trips between those ops.
 ``GONKA_POC_FUSED=0`` turns them off.
 """
 
 import os
+from contextlib import contextmanager
 
+import numpy as np
 import torch
 
 try:
@@ -138,6 +141,40 @@ if triton is not None:
         tl.store(o_ptr + row * H + cols, tl.where(m != 0, poc_e, e), mask=cm)
 
 
+    @triton.jit
+    def _half(v, H: tl.constexpr):
+        # lane l adds lane l + H (shfl_down by H): [2H] -> [H]
+        x, y = tl.split(tl.trans(tl.reshape(v, (2, H))))
+        return x + y
+
+    @triton.jit
+    def _norm_row(src, dst, w_ptr, N: tl.constexpr, factor, eps):
+        # torch's mean of an fp32 row: one warp, four accumulators per lane over
+        # float4 loads strided by 32 lanes, folded in order, then shfl_down 16..1.
+        offs = tl.arange(0, 128)
+        acc = tl.zeros((128,), dtype=tl.float32)
+        for t in tl.static_range(N // 128):
+            x = tl.load(src + t * 128 + offs).to(tl.float32)
+            acc = acc + x * x
+        e, o = tl.split(tl.reshape(acc, (32, 2, 2)))
+        a0, a2 = tl.split(e)
+        a1, a3 = tl.split(o)
+        v = _half(_half(_half(_half(((a0 + a1) + a2) + a3, 16), 8), 4), 2)
+        x, y = tl.split(tl.reshape(v, (1, 2)))
+        r = libdevice.rsqrt(tl.sum(x + y, axis=0) * factor + eps)
+        for t in tl.static_range(N // 128):
+            x = tl.load(src + t * 128 + offs).to(tl.float32)
+            w = tl.load(w_ptr + t * 128 + offs).to(tl.float32)
+            tl.store(dst + t * 128 + offs, ((x * r) * w).to(dst.dtype.element_ty))
+
+    @triton.jit
+    def _qk_norm_kernel(q_ptr, k_ptr, q_stride, k_stride, qw_ptr, kw_ptr, q_out, k_out,
+                        Q: tl.constexpr, K: tl.constexpr, q_factor, k_factor, q_eps, k_eps):
+        row = tl.program_id(0).to(tl.int64)
+        _norm_row(q_ptr + row * q_stride, q_out + row * Q, qw_ptr, Q, q_factor, q_eps)
+        _norm_row(k_ptr + row * k_stride, k_out + row * K, kw_ptr, K, k_factor, k_eps)
+
+
 def router_override(logits, base, step, mask, n_experts: int, top_k: int,
                     ladder: int):
     """torch.where(mask[:,None], expert_logits_from_base(base, step, ...)
@@ -186,6 +223,60 @@ def embed_synth(out, base, step, prev_k, embeds, mask, hidden: int, salt: int,
         out, o, base, step, prev_k, embeds, mask, hidden, (hidden + 1) // 2,
         mix_a, mix_b, salt, BLOCK=512, enable_fp_fusion=False)
     return o
+
+
+def _f32(x) -> float:
+    return float(np.float32(x))
+
+
+def _minimax_forward_qk(q_norm, k_norm, q, k):
+    """MiniMaxText01RMSNormTP.forward_qk (TP 1) in one kernel, bit for bit."""
+    if not (q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and k.dtype == q.dtype
+            and q.stride(-1) == 1 and k.stride(-1) == 1 and q.dim() == 2 and k.dim() == 2
+            and q.shape[1] % 128 == 0 and k.shape[1] % 128 == 0):
+        return _MINIMAX_FORWARD_QK(q_norm, k_norm, q, k)
+    m, qn, kn = q.shape[0], q.shape[1], k.shape[1]
+    q_out = torch.empty((m, qn), dtype=q.dtype, device=q.device)
+    k_out = torch.empty((m, kn), dtype=k.dtype, device=k.device)
+    if m:
+        # torch's mean factor: float(outputs) / numel, one fp32 division
+        _qk_norm_kernel[(m,)](
+            q, k, q.stride(0), k.stride(0), q_norm.weight, k_norm.weight, q_out, k_out,
+            Q=qn, K=kn, q_factor=_f32(np.float32(m) / np.float32(m * qn)),
+            k_factor=_f32(np.float32(m) / np.float32(m * kn)),
+            q_eps=_f32(q_norm.variance_epsilon), k_eps=_f32(k_norm.variance_epsilon),
+            num_warps=1, enable_fp_fusion=False)
+    return q_out, k_out
+
+
+_MINIMAX_NORM = None
+_MINIMAX_FORWARD_QK = None
+
+
+@contextmanager
+def model_ops():
+    """Fused stand-ins for model ops the eager PoC forward runs in plain torch:
+    MiniMax-M2's q/k RMSNorm at TP 1."""
+    global _MINIMAX_NORM, _MINIMAX_FORWARD_QK
+    if not enabled():
+        yield
+        return
+    if _MINIMAX_NORM is None:
+        try:
+            from vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp import (
+                MiniMaxText01RMSNormTP as _MINIMAX_NORM)
+        except ImportError:
+            _MINIMAX_NORM = False
+        else:
+            _MINIMAX_FORWARD_QK = _MINIMAX_NORM.forward_qk
+    if not _MINIMAX_NORM:
+        yield
+        return
+    _MINIMAX_NORM.forward_qk = staticmethod(_minimax_forward_qk)
+    try:
+        yield
+    finally:
+        _MINIMAX_NORM.forward_qk = staticmethod(_MINIMAX_FORWARD_QK)
 
 
 def warmup(state, dtype) -> None:
