@@ -28,6 +28,7 @@ from gonka_poc.poc.gpu_random import (generate_householder_vector,
 from gonka_poc.poc.decode_random import (decode_pseudo_token_ids,
                                          expert_logits_from_base, route_base_seed,
                                          pinned_to_device)
+from gonka_poc.poc import decode_random, fused
 
 # Block hashes kept in the router-seed memo. One scope holds a round's
 # nonces; a new round makes the old scope unreachable, so a handful is
@@ -107,6 +108,9 @@ class PoCLayerWrapper(nn.Module):
         # row hc_mult times). Broadcast the per-row vector and mask over whatever
         # dimensions sit there; the reflection always runs along the hidden dim.
         n = x.shape[0]
+        if self._st.fused and x.is_contiguous():
+            return fused.reflect_rows(x, self.poc_table, self.poc_row_group[:n],
+                                      self.poc_mask[:n])
         pad = (1,) * (x.dim() - 2)
         v = self.poc_table.index_select(0, self.poc_row_group[:n])
         return _reflect(x, v.view(n, *pad, -1).to(x.dtype),
@@ -166,7 +170,12 @@ class PoCEmbeddingWrapper(nn.Module):
         # it rides the captured forward (no eager RNG on the host between steps).
         # prev_k<0 rows (prefill) fall back to the pre-filled embed.
         from gonka_poc.poc.decode_random import (
-            _step_seeds, _batched_normal_t, _SALT_DECODE_EMBED)
+            _step_seeds, _batched_normal_t, _SALT_DECODE_EMBED, _MIX_A, _MIX_B)
+        if self._st.fused and out.is_contiguous():
+            return fused.embed_synth(out, self.embed_base[:n], self.embed_step[:n],
+                                     self.embed_prev_k[:n], self.poc_embeds[:n],
+                                     m_rows, self.hidden_size, _SALT_DECODE_EMBED,
+                                     _MIX_A, _MIX_B)
         seeds = _step_seeds(self.embed_base[:n], self.embed_step[:n],
                             self.embed_prev_k[:n], _SALT_DECODE_EMBED)
         dec = _batched_normal_t(seeds, self.hidden_size, out.device).to(out.dtype)
@@ -272,11 +281,17 @@ class PoCRouterWrapper(nn.Module):
         out = self._inner_call(*args, **kwargs)
         logits = out[0] if isinstance(out, tuple) else out
         n = logits.shape[0]
-        m = self.poc_mask[:n].unsqueeze(-1)
-        forced = expert_logits_from_base(                   # in-graph seeded selection
-            self.poc_route_base[:n], self.poc_route_step[:n],
-            self.n_experts, self.top_k, logits.device).to(logits.dtype)
-        logits = torch.where(m, forced, logits)
+        if self._st.fused and logits.is_contiguous():
+            logits = fused.router_override(
+                logits, self.poc_route_base[:n], self.poc_route_step[:n],
+                self.poc_mask[:n], self.n_experts, self.top_k,
+                decode_random._ladder_base)
+        else:
+            m = self.poc_mask[:n].unsqueeze(-1)
+            forced = expert_logits_from_base(               # in-graph seeded selection
+                self.poc_route_base[:n], self.poc_route_step[:n],
+                self.n_experts, self.top_k, logits.device).to(logits.dtype)
+            logits = torch.where(m, forced, logits)
         return (logits, *out[1:]) if isinstance(out, tuple) else logits
 
 
@@ -303,6 +318,9 @@ class PoCNativeState:
         # (PoCRunnerBridge.set_active). A compiled forward is traced once and
         # keeps them: the flag stays True there.
         self.active = True
+        # The wrappers' fused Triton kernels (gonka_poc.poc.fused): set by the
+        # bridge where the wrappers run outside torch.compile.
+        self.fused = False
         # ONE [layers, groups, hidden] table; self.table keeps the per-layer
         # entries as VIEWS into it. A group is one (block_hash[, nonce]) draw,
         # group 0 is the zero vector; rows point at their group through the

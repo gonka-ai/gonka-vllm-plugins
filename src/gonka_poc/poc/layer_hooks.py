@@ -12,6 +12,7 @@ from typing import List
 import torch
 
 from .gpu_random import generate_householder_vector, apply_householder
+from . import fused
 
 # Safe as a plain global: the PoC forward is synchronous and single-threaded.
 _poc_forward_active_flag: bool = False
@@ -82,7 +83,10 @@ class LayerHouseholderHook:
             v = self.reflection_vectors[layer_idx]
 
             def transform(x):
-                return apply_householder(x, v.to(x.dtype))
+                vx = v.to(x.dtype)
+                if fused.usable(x):
+                    return fused.householder(x, vx)
+                return apply_householder(x, vx)
 
             if isinstance(output, tuple):
                 if len(output) >= 2:

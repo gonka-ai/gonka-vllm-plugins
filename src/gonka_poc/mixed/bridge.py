@@ -22,6 +22,7 @@ import torch
 
 from vllm.logger import init_logger
 from gonka_poc.poc.decode_random import pinned_to_device
+from gonka_poc.poc import fused
 from gonka_poc.mixed import runtime as mixed_decode
 
 if TYPE_CHECKING:
@@ -111,6 +112,12 @@ class PoCRunnerBridge:
         runner._poc_native = self.native
         self.gated = bool(getattr(
             getattr(runner, "cudagraph_dispatcher", None), "poc_graphs", False))
+        # Without torch.compile each wrapper op is its own kernel; fuse them.
+        # A compiled forward gets its fusion from Inductor.
+        if self.gated and fused.enabled():
+            fused.warmup(self.native, runner.dtype)
+            self.native.fused = True
+            logger.info("PoC decode wrappers: fused Triton kernels")
 
     # --------------------------------------------------------- per-step hooks
     def pre_step(self, scheduler_output: "SchedulerOutput") -> bool:
