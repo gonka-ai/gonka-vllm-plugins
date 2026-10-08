@@ -449,7 +449,7 @@ async def _generation_loop(
             await _decode_mining(engine_client, stop_event, callback_sender, config,
                                  stats, nonce_iter, batch_size)
         elif worker_mining:
-            await _worker_mining(engine_client, stop_event, callback_sender, config, stats)
+            await _worker_mining(engine_client, stop_event, callback_sender, config, stats, batch_size)
         while not poc_decode and not worker_mining and not stop_event.is_set():
             nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
             
@@ -516,11 +516,12 @@ async def _generation_loop(
             await reset_prefix_cache_after_inplace_poc(engine_client)
 
 
-async def _worker_mining(engine_client, stop_event, callback_sender, config, stats):
+async def _worker_mining(engine_client, stop_event, callback_sender, config, stats, batch_size):
     """Prefill mining driven from the workers: every rank runs the sub-batches
     back to back in a thread, the API polls the artifacts out every
-    POC_CALLBACK_INTERVAL_SEC. The pipeline never drains between chunks."""
-    sub = int(os.environ.get("POC_WORKER_SUBBATCH", "32"))
+    POC_CALLBACK_INTERVAL_SEC. The pipeline never drains between chunks. The
+    sub-batch is the round's batch size unless POC_WORKER_SUBBATCH overrides it."""
+    sub = int(os.environ.get("POC_WORKER_SUBBATCH", "0")) or batch_size
     poll = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "1"))
     meta = {"public_key": config["public_key"], "block_hash": config["block_hash"],
             "block_height": config["block_height"], "node_id": config["node_id"]}
