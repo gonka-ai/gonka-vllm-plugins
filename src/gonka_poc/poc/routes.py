@@ -444,10 +444,13 @@ async def _generation_loop(
     pending_nonces = None
     
     try:
+        worker_mining = not poc_decode and bool(int(os.environ.get("POC_WORKER_MINING", "0")))
         if poc_decode:
             await _decode_mining(engine_client, stop_event, callback_sender, config,
                                  stats, nonce_iter, batch_size)
-        while not poc_decode and not stop_event.is_set():
+        elif worker_mining:
+            await _worker_mining(engine_client, stop_event, callback_sender, config, stats, batch_size)
+        while not poc_decode and not worker_mining and not stop_event.is_set():
             nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
             
             try:
@@ -511,6 +514,50 @@ async def _generation_loop(
             # cached hashes -- drop the prefix cache so later hits cannot serve
             # PoC-clobbered KV (as 0.1.6 does; see reservation module docstring).
             await reset_prefix_cache_after_inplace_poc(engine_client)
+
+
+async def _worker_mining(engine_client, stop_event, callback_sender, config, stats, batch_size):
+    """Prefill mining driven from the workers: every rank runs the sub-batches
+    back to back in a thread, the API polls the artifacts out every
+    POC_CALLBACK_INTERVAL_SEC. The pipeline never drains between chunks. The
+    sub-batch is the round's batch size unless POC_WORKER_SUBBATCH overrides it."""
+    sub = int(os.environ.get("POC_WORKER_SUBBATCH", "0")) or batch_size
+    poll = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "1"))
+    meta = {"public_key": config["public_key"], "block_hash": config["block_hash"],
+            "block_height": config["block_height"], "node_id": config["node_id"]}
+
+    def deliver(results):
+        seen, arts = set(), []
+        for rr in results:
+            for a in (rr or {}).get("artifacts", []) or []:
+                if a["nonce"] not in seen:
+                    seen.add(a["nonce"]); arts.append(a)
+        if arts and callback_sender:
+            callback_sender.add_artifacts([Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"]) for a in arts], meta)
+        stats["total_processed"] += len(arts)
+        return [rr.get("error") for rr in results if rr and rr.get("error")]
+
+    await engine_client.collective_rpc("execute_poc_mine_start", timeout=60, kwargs={
+        "block_hash": config["block_hash"], "public_key": config["public_key"],
+        "seq_len": int(config["seq_len"]), "k_dim": int(config["k_dim"]),
+        "poc_stronger_rng": bool(config["poc_stronger_rng"]),
+        "node_id": int(config["node_id"]), "n_nodes": int(config["node_count"]),
+        "group_id": int(config["group_id"]), "n_groups": int(config["n_groups"]), "sub_batch": sub})
+    logger.info("PoC worker mining started: sub-batch %d, poll every %.2f s", sub, poll)
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(poll)
+            res = await engine_client.collective_rpc("execute_poc_mine_poll", timeout=60)
+            errs = deliver(res)
+            if errs or not any((rr or {}).get("alive") for rr in res):
+                raise RuntimeError(f"PoC worker mining stopped: {errs or 'no live rank'}")
+    finally:
+        flags = await engine_client.collective_rpc("execute_poc_mine_flag", timeout=60)
+        target = max(int((f or {}).get("started", 0)) for f in flags)
+        res = await engine_client.collective_rpc("execute_poc_mine_stop", timeout=600, kwargs={"stop_at": target})
+        deliver(res)
+        logger.info("PoC worker mining stopped at batch %d: per-batch %s", target,
+                    [round(r.get("per_batch_s") or 0, 3) for r in res if r])
 
 
 # =============================================================================
