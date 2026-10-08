@@ -339,3 +339,9 @@ def warmup(state, dtype) -> None:
                 torch.zeros(2, h, dtype=state.embeds.dtype, device=dev), mask, h,
                 dr._SALT_DECODE_EMBED, dr._MIX_A, dr._MIX_B)
     torch.cuda.synchronize(dev)
+
+
+if enabled():
+    from . import vllm_kernels
+
+    vllm_kernels.install()
