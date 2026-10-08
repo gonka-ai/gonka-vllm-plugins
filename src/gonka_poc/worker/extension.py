@@ -154,6 +154,42 @@ class PoCWorkerExtension:
 
         return {"artifacts": artifacts, "rank": rank}
 
+    def execute_poc_forward_multi(
+        self,
+        *,
+        block_hash: str,
+        public_key: str,
+        nonce_batches: List[List[int]],
+        seq_len: int,
+        k_dim: int = 12,
+        poc_stronger_rng: bool = False,
+    ) -> Dict[str, Any]:
+        """Several prefill batches in one RPC, back to back on every rank.
+
+        Under pipeline parallelism the first rank runs its layers for batch
+        k+1 while the last rank runs its layers for batch k: the send of one
+        batch's hidden state only has to match the next rank's receive, so
+        the ranks settle one batch apart and both stay busy. A single-batch
+        RPC leaves each rank idle while the other works.
+        """
+        import time
+
+        from vllm.logger import init_logger
+        log = init_logger(__name__)
+        artifacts: List[Dict[str, Any]] = []
+        times = []
+        for batch in nonce_batches:
+            t0 = time.time()
+            res = self.execute_poc_forward(
+                block_hash=block_hash, public_key=public_key, nonces=list(batch),
+                seq_len=seq_len, k_dim=k_dim, poc_stronger_rng=poc_stronger_rng)
+            times.append(time.time() - t0)
+            artifacts.extend(res.get("artifacts", []) or [])
+        log.info("PoC multi-batch forward: %d batches x %d nonces, per batch %s s",
+                 len(nonce_batches), len(nonce_batches[0]) if nonce_batches else 0,
+                 " ".join(f"{t:.2f}" for t in times))
+        return {"artifacts": artifacts, "rank": int(getattr(self, "rank", -1))}
+
     def execute_poc_borrow_compat(self) -> Dict[str, Any]:
         """Report whether borrowed-lease validation is bit-safe on this rank.
 
