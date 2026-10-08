@@ -113,6 +113,41 @@ if triton is not None:
                  (xb.to(tl.float32) - t.to(tl.float32)).to(xb.dtype), mask=cm)
 
     @triton.jit
+    def _warp_sum_vec8(acc):
+        # torch's bf16 row sum: one warp, 8 consecutive elements per lane (16-byte loads)
+        # accumulated in fp32 and folded in order, then shfl_down 16, 8, 4, 2, 1.
+        e, o = tl.split(tl.reshape(acc, (32, 4, 2)))
+        e04, e26 = tl.split(tl.reshape(e, (32, 2, 2)))
+        o15, o37 = tl.split(tl.reshape(o, (32, 2, 2)))
+        a0, a4 = tl.split(e04)
+        a2, a6 = tl.split(e26)
+        a1, a5 = tl.split(o15)
+        a3, a7 = tl.split(o37)
+        s = ((((((a0 + a1) + a2) + a3) + a4) + a5) + a6) + a7
+        s = _half(_half(_half(_half(s, 16), 8), 4), 2)
+        sx, sy = tl.split(tl.reshape(s, (1, 2)))
+        return tl.sum(sx + sy, axis=0)
+
+    @triton.jit
+    def _householder_row_kernel(x_ptr, v_ptr, o_ptr, N: tl.constexpr):
+        # apply_householder on one bf16 row: dot = bf16(sum(bf16(x*v))), out = bf16(x - bf16(bf16(2*dot)*v))
+        row = tl.program_id(0).to(tl.int64)
+        offs = tl.arange(0, 256)
+        acc = tl.zeros((256,), dtype=tl.float32)
+        for t in tl.static_range(N // 256):
+            xb = tl.load(x_ptr + row * N + t * 256 + offs)
+            vb = tl.load(v_ptr + t * 256 + offs)
+            acc = acc + (xb * vb).to(tl.float32)
+        dot = _warp_sum_vec8(acc).to(tl.bfloat16)
+        d2 = (dot.to(tl.float32) * 2.0).to(tl.bfloat16)
+        for t in tl.static_range(N // 256):
+            xb = tl.load(x_ptr + row * N + t * 256 + offs)
+            vb = tl.load(v_ptr + t * 256 + offs)
+            tt = (d2.to(tl.float32) * vb.to(tl.float32)).to(tl.bfloat16)
+            tl.store(o_ptr + row * N + t * 256 + offs,
+                     (xb.to(tl.float32) - tt.to(tl.float32)).to(tl.bfloat16))
+
+    @triton.jit
     def _embed_kernel(e_ptr, o_ptr, base_ptr, step_ptr, pk_ptr, pe_ptr, mask_ptr,
                       H, NP, MIXA: tl.constexpr, MIXB: tl.constexpr,
                       SALT: tl.constexpr, BLOCK: tl.constexpr):
@@ -206,6 +241,12 @@ def householder(x, v):
     """gpu_random.apply_householder(x, v) with v already in x.dtype."""
     d = x.shape[-1]
     lines = x.numel() // d
+    if (x.dtype == torch.bfloat16 and x.is_contiguous() and d % 256 == 0
+            and v.dtype == torch.bfloat16 and v.is_contiguous()):
+        # every line (DeepSeek-V4 keeps hc_mult copies per row) is reflected along the hidden dim with the same v
+        out = torch.empty_like(x)
+        _householder_row_kernel[(lines,)](x.view(-1, d), v, out.view(-1, d), N=d, num_warps=1, enable_fp_fusion=False)
+        return out
     dot = (x * v).sum(dim=-1, keepdim=True)
     out = torch.empty_like(x)
     _householder_tail_kernel[(lines, triton.cdiv(d, 1024))](
