@@ -117,6 +117,8 @@ class PoCParamsModel(BaseModel):
             self.scheme = "decode"
         elif self.scheme == "decode":
             self.decode = True
+        if self.scheme == "decode" and self.max_tokens <= 0:
+            raise ValueError("the decode scheme needs max_tokens > 0")
         return self
 
 
@@ -718,8 +720,11 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             # decode flow (max_tokens>0) → per-nonce snap margin vs dist_threshold
             # (tau); prefill flow → vector-L2 vs dist_threshold. Same binomial,
             # same response shape.
-            use_trajectory=body.params.max_tokens > 0,
+            use_trajectory=body.params.scheme == "decode",
             ref_vectors=ref_vectors,
+            references=enforced_k_steps if body.params.scheme == "decode" else None,
+            expected_steps=(body.params.max_tokens + 1
+                            if body.params.scheme == "decode" else None),
         )
     except ValueError as e:
         # No comparison happened for some artifact: not a verdict.
