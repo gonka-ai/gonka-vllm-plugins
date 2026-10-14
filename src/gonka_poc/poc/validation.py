@@ -10,6 +10,9 @@ from .data import decode_vector, fraud_test, DEFAULT_DIST_THRESHOLD, DEFAULT_P_M
 
 logger = init_logger(__name__)
 
+DECODE_SPHERE_POINTS = 16
+MALFORMED_REFERENCE_MARGIN = 2.0
+
 # Per-step vector-divergence tolerance: a decode step "diverged" if its pre-snap
 # cosine distance exceeds this. Honest cross-HW jitter sits far below it and fraud
 # far above (pilot: ~60x gap), so the exact value is not sensitive — one knob, like
@@ -157,6 +160,8 @@ def run_validation(
     use_trajectory: bool = False,
     ref_vectors: Optional[Dict[int, List[str]]] = None,
     requested_nonces: Optional[List[int]] = None,
+    references: Optional[Dict[int, List[int]]] = None,
+    expected_steps: Optional[int] = None,
 ) -> Dict:
     """Run full validation with fraud test. Same response shape for both flows.
 
@@ -189,9 +194,23 @@ def run_validation(
         # binomial test then runs over nonces with p_mismatch/fraud_threshold.
         n_mismatch = 0
         mismatch_nonces = []
+        unscorable = []
         for a in computed_artifacts:
             traj = a.get("k_points_steps") or []
-            if not traj:
+            if not traj or (expected_steps is not None
+                            and len(traj) != expected_steps):
+                unscorable.append(a["nonce"])
+                continue
+            ref = references.get(a["nonce"]) if references is not None else None
+            if ref is not None and (
+                    (expected_steps is not None and len(ref) != expected_steps)
+                    or any(not 0 <= k < DECODE_SPHERE_POINTS for k in ref)):
+                n_mismatch += 1
+                mismatch_nonces.append(a["nonce"])
+                per_nonce.append({"nonce": a["nonce"], "n_sphere_mismatches": -1,
+                                  "n_steps": len(ref),
+                                  "mismatch_margin_max": MALFORMED_REFERENCE_MARGIN,
+                                  "mismatch": True, "malformed_reference": True})
                 continue
             m = a.get("n_sphere_mismatches")
             if m is None or m < 0:
@@ -208,6 +227,14 @@ def run_validation(
                               "mismatch": flagged})
             if flagged:
                 mismatch_nonces.append(a["nonce"])
+        if unscorable:
+            logger.warning("decode validation: %d nonce(s) with an empty or short "
+                           "computed trajectory leave the sample: %s",
+                           len(unscorable), unscorable[:8])
+            excluded = excluded + unscorable
+            n_total -= len(unscorable)
+            if n_total <= 0:
+                raise ValueError("no nonce produced a scorable trajectory")
         p_value, fraud_detected = fraud_test(n_mismatch, n_total, p_mismatch, fraud_threshold)
     else:
         n_mismatch, mismatch_nonces = validate_artifacts(

@@ -190,6 +190,7 @@ async def compute_nonce_artifacts(
                             "chain is NOT work — it must not be scored.",
                             nonce, got, max_tokens + 1,
                             " (EMPTY)" if got == 0 else "")
+                        return None
                     if artifact["n_nan_steps"]:
                         # a non-finite step is a compute fault: no -1 on the wire, no vote
                         logger.warning("PoC nonce %s: %d non-finite step(s) — artifact dropped",
@@ -498,8 +499,10 @@ class GenerateQueue:
             p_mismatch=job.stat_test_p_mismatch,
             fraud_threshold=job.stat_test_fraud_threshold,
             k_dim=job.k_dim,
-            use_trajectory=job.max_tokens > 0,
+            use_trajectory=job.poc_decode,
             ref_vectors=job.ref_vectors,
+            references=job.enforced_k_steps if job.poc_decode else None,
+            expected_steps=job.max_tokens + 1 if job.poc_decode else None,
         )
         
         return {
