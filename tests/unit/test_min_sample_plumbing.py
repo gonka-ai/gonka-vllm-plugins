@@ -24,6 +24,22 @@ def test_stat_test_model_reads_dapi_min_count():
     assert model.fraud_threshold == 0.05
 
 
+def test_stat_test_model_reads_legacy_dapi_threshold():
+    payload = {k: v for k, v in DAPI_STAT_TEST.items() if k != "fraud_threshold"}
+    payload["p_value_threshold"] = 0.05
+    assert StatTestModel.model_validate(payload).fraud_threshold == 0.05
+
+
+def test_stat_test_model_prefers_canonical_threshold():
+    payload = {**DAPI_STAT_TEST, "p_value_threshold": 0.01}
+    assert StatTestModel.model_validate(payload).fraud_threshold == 0.05
+
+
+def test_stat_test_model_preserves_zero_threshold():
+    assert StatTestModel.model_validate({"fraud_threshold": 0}).fraud_threshold == 0
+    assert StatTestModel.model_validate({"p_value_threshold": 0}).fraud_threshold == 0
+
+
 def test_stat_test_model_defaults_min_count_to_zero():
     payload = {k: v for k, v in DAPI_STAT_TEST.items() if k != "min_count"}
     assert StatTestModel.model_validate(payload).min_count == 0

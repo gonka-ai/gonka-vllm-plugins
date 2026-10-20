@@ -179,6 +179,12 @@ Computes artifacts for a fixed nonce list (either synchronous via
 * `wait=true` blocks until artifacts are computed; if `validation` is
   attached, runs the L2 statistical test and returns the verdict inline.
 
+`fraud_threshold` is the binomial p-value cutoff. The legacy DAPI name
+`p_value_threshold` is also accepted; if both are supplied, `fraud_threshold`
+takes precedence. The updated DAPI sends the chain's configured value, so a
+chain setting of 0.05 now takes effect instead of silently using the plugin's
+0.01 default. Explicit zero values are preserved.
+
 `min_count` defaults to zero (disabled). Validation counts distinct requested
 nonces with computed artifacts, excluding outputs lost by the runner. Below
 the minimum, or for an empty scored sample, the result carries

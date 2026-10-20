@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from vllm.logger import init_logger
 from gonka_poc._compat import current as _compat_current
@@ -191,7 +191,10 @@ class ValidationModel(BaseModel):
 class StatTestModel(BaseModel):
     dist_threshold: float = DEFAULT_DIST_THRESHOLD
     p_mismatch: float = DEFAULT_P_MISMATCH
-    fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
+    fraud_threshold: float = Field(
+        default=DEFAULT_FRAUD_THRESHOLD,
+        validation_alias=AliasChoices("fraud_threshold", "p_value_threshold"),
+    )
     min_count: int = Field(default=0, ge=0)
 
 
