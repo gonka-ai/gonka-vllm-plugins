@@ -95,6 +95,10 @@ class PoCRunnerBridge:
         from gonka_poc.mixed.native import attach_native_poc
 
         runner = self.runner
+        if getattr(runner, "speculative_config", None) is not None:
+            raise RuntimeError(
+                "decode PoC: mixed PoC/chat steps do not support speculative "
+                "decoding")
         inner, layers, tried = _decoder_owner(model)
         if layers is None:
             raise RuntimeError(
@@ -272,74 +276,45 @@ class PoCRunnerBridge:
         chat_rows = self._chat_rows()
         if not chat_rows:
             return None
-        idx = pinned_to_device(chat_rows, torch.long, sample_hidden_states.device)
-        return self.runner.model.compute_logits(sample_hidden_states[idx])
+        n_rows = sample_hidden_states.shape[0]
+        if n_rows != self._step["num_reqs_snapshot"]:
+            raise RuntimeError(
+                f"mixed PoC: {n_rows} logits rows for "
+                f"{self._step['num_reqs_snapshot']} requests")
+        device = sample_hidden_states.device
+        if getattr(self.runner, "lora_config", None):
+            full = self.runner.model.compute_logits(sample_hidden_states)
+            if full is None:
+                return None
+            full.index_fill_(
+                0, pinned_to_device(self._poc_rows(), torch.long, device), 0)
+            return full
+        idx = pinned_to_device(chat_rows, torch.long, device)
+        chat = self.runner.model.compute_logits(sample_hidden_states[idx])
+        if chat is None:
+            return None
+        full = chat.new_zeros((n_rows, chat.shape[1]))
+        full.index_copy_(0, idx, chat)
+        return full
+
+    def _poc_rows(self) -> list[int]:
+        chat = set(self._chat_rows())
+        return [i for i in range(self._step["num_reqs_snapshot"]) if i not in chat]
 
     def sample_chat_rows(self, logits, sampling_metadata):
-        # Sample CHAT ROWS ONLY, scatter back into a full natural-order tensor
-        # (PoC slots = 0, never read). 0.20: _sample mixed branch, verbatim.
         from vllm.v1.outputs import SamplerOutput
 
         runner = self.runner
-        chat_rows = self._chat_rows()
+        poc_rows = self._poc_rows()
         n_full = self._step["num_reqs_snapshot"]
-        if not chat_rows:
+        if logits is None:
             return SamplerOutput(
                 sampled_token_ids=torch.zeros(
                     (n_full, 1), dtype=torch.int32, device=runner.device),
                 logprobs_tensors=None,
             )
-        chat_sm = mixed_decode.slice_sampling_metadata(
-            sampling_metadata, chat_rows, runner.device)
-        chat_out = runner.sampler(logits=logits, sampling_metadata=chat_sm)
-        idx = pinned_to_device(chat_rows, torch.long, runner.device)
-        full = torch.zeros(
-            (n_full, chat_out.sampled_token_ids.shape[1]),
-            dtype=chat_out.sampled_token_ids.dtype, device=runner.device)
-        full[idx] = chat_out.sampled_token_ids
-        return SamplerOutput(
-            sampled_token_ids=full,
-            logprobs_tensors=self._scatter_logprobs(
-                chat_out.logprobs_tensors, idx, n_full),
-        )
-
-    @staticmethod
-    def _scatter_logprobs(lp, idx, n_full: int):
-        """Lift chat-only logprob rows into the same natural order as the tokens.
-
-        ``sampled_token_ids`` is scattered to full batch width, but the sampler
-        saw chat rows only, so its logprobs come back compacted 0..len(chat)-1.
-        The runner reads the two in parallel by request index
-        (``output.sampled_token_ids`` / ``output.logprobs``), so leaving them in
-        different row spaces hands a chat request the logprobs of whichever row
-        follows a PoC row. Same disease as the renumbering incident the natural
-        -order rule exists to prevent, just on the other tensor.
-
-        PoC rows get zero rows that nothing reads: PoC carries no sampling
-        params and never asks for logprobs.
-        """
-        from vllm.v1.outputs import LogprobsTensors
-
-        if lp is None:
-            return None
-        n_rows = lp.logprobs.shape[0]
-        if n_rows != idx.shape[0]:
-            # >1 row per request (spec decode) needs a per-request row map,
-            # which this path does not carry. Refuse rather than mis-index.
-            raise RuntimeError(
-                f"mixed PoC: cannot place {n_rows} logprob rows over "
-                f"{idx.shape[0]} chat rows; per-request row counts differ")
-
-        def _lift(t):
-            if t is None or t.numel() == 0:
-                return t
-            out = torch.zeros((n_full, *t.shape[1:]),
-                              dtype=t.dtype, device=t.device)
-            out[idx] = t
-            return out
-
-        return LogprobsTensors(
-            _lift(lp.logprob_token_ids),
-            _lift(lp.logprobs),
-            _lift(lp.selected_token_ranks),
-        )
+        out = runner.sampler(logits=logits, sampling_metadata=sampling_metadata)
+        if poc_rows:
+            out.sampled_token_ids[
+                pinned_to_device(poc_rows, torch.long, runner.device)] = 0
+        return out

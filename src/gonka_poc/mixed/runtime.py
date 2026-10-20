@@ -78,55 +78,6 @@ def encode_sph_slices(q_host, block_hash, public_key, nonce, k_dim, debug):
     return [encode_vector(row[idx_all[step]]) for step, row in enumerate(q_host)]
 
 
-def slice_sampling_metadata(sm, rows, device):
-    """Restrict a SamplingMetadata to `rows` (input_batch indices), so the sampler
-    runs on chat rows only. PoC rows have no sampling semantics; keeping them out
-    avoids stale/oversized penalty tensors and the per-row param mismatch."""
-    import dataclasses
-
-    from gonka_poc.poc.decode_random import pinned_to_device
-
-    idx = pinned_to_device(rows, torch.long, device)
-    keep = set(rows)
-    remap = {old: new for new, old in enumerate(rows)}
-
-    def take_t(t):
-        return None if t is None else t[idx]
-
-    def take_list(lst):
-        return [lst[i] for i in rows] if lst else lst
-
-    def remap_dict(d):
-        return None if d is None else {remap[k]: v for k, v in d.items() if k in keep}
-
-    sliced = dataclasses.replace(
-        sm,
-        temperature=take_t(sm.temperature),
-        top_p=take_t(sm.top_p),
-        top_k=take_t(sm.top_k),
-        generators=remap_dict(sm.generators) or {},
-        logprob_token_ids=remap_dict(sm.logprob_token_ids),
-        prompt_token_ids=take_t(sm.prompt_token_ids),
-        frequency_penalties=take_t(sm.frequency_penalties),
-        presence_penalties=take_t(sm.presence_penalties),
-        repetition_penalties=take_t(sm.repetition_penalties),
-        output_token_ids=take_list(sm.output_token_ids),
-        spec_token_ids=take_list(sm.spec_token_ids),
-        allowed_token_ids_mask=take_t(sm.allowed_token_ids_mask),
-        bad_words_token_ids=remap_dict(sm.bad_words_token_ids),
-    )
-    # enforced_next_token_ids: 0.20-only field (inference-validation feature,
-    # not decode-PoC). Slice it when the base engine carries it.
-    if hasattr(sm, "enforced_next_token_ids"):
-        sliced.enforced_next_token_ids = take_t(sm.enforced_next_token_ids)
-    return sliced
-
-
-
-
-
-
-
 @dataclass
 class PoCDecodeState:
     """Per-request decode state, carried across scheduler steps."""
