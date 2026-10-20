@@ -3,6 +3,7 @@ import asyncio
 import time
 from collections import deque
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -22,6 +23,20 @@ POC_CALLBACK_RETRY_BACKOFF_SEC = 1.0
 POC_CALLBACK_RETRY_MAX_BACKOFF_SEC = 30.0
 
 
+def _callback_log_target(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        if parsed.scheme not in ("http", "https") or not host:
+            return "<callback>"
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except ValueError:
+        return "<callback>"
+
+
 class CallbackSender:
     """Manages callback sending with retry and bounded buffer.
 
@@ -37,6 +52,7 @@ class CallbackSender:
         max_artifacts: int = POC_CALLBACK_MAX_ARTIFACTS,
     ):
         self.callback_url = callback_url
+        self._log_target = _callback_log_target(callback_url)
         self.stop_event = stop_event
         self.k_dim = k_dim
         self.max_artifacts = max_artifacts
@@ -93,21 +109,21 @@ class CallbackSender:
                     success = await self._send_callback(session, self._pending_payload)
                     if success:
                         if retry_attempt > 1:
-                            logger.info(f"Callback to {self.callback_url} succeeded after {retry_attempt} attempts")
+                            logger.info(f"Callback to {self._log_target} succeeded after {retry_attempt} attempts")
                         self._pending_payload = None
                         backoff = POC_CALLBACK_RETRY_BACKOFF_SEC
                         retry_attempt = 0
                         last_send_time = current_time
                     elif retry_attempt >= POC_CALLBACK_MAX_RETRIES:
                         n_artifacts = len(self._pending_payload.get('artifacts', []))
-                        logger.error(f"Callback to {self.callback_url} failed after {retry_attempt} attempts, dropping {n_artifacts} artifacts")
+                        logger.error(f"Callback to {self._log_target} failed after {retry_attempt} attempts, dropping {n_artifacts} artifacts")
                         self._pending_payload = None
                         backoff = POC_CALLBACK_RETRY_BACKOFF_SEC
                         retry_attempt = 0
                         last_send_time = current_time
                     else:
                         if retry_attempt == 1 or retry_attempt % 10 == 0:
-                            logger.warning(f"Callback to {self.callback_url} failed (attempt {retry_attempt}/{POC_CALLBACK_MAX_RETRIES}, next backoff {backoff:.1f}s)")
+                            logger.warning(f"Callback to {self._log_target} failed (attempt {retry_attempt}/{POC_CALLBACK_MAX_RETRIES}, next backoff {backoff:.1f}s)")
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, POC_CALLBACK_RETRY_MAX_BACKOFF_SEC)
     
@@ -220,6 +236,7 @@ class CallbackQueue:
             backoff = POC_CALLBACK_RETRY_BACKOFF_SEC
             attempt = 0
             url_path = f"{url}/{path}"
+            log_target = _callback_log_target(url)
 
             while attempt < POC_CALLBACK_MAX_RETRIES:
                 attempt += 1
@@ -234,17 +251,17 @@ class CallbackQueue:
                     ) as resp:
                         if resp.status < 400:
                             if attempt > 1:
-                                logger.info(f"Callback to {url_path} succeeded after {attempt} attempts")
+                                logger.info(f"Callback to {log_target} succeeded after {attempt} attempts")
                             return True
-                        logger.warning(f"Callback to {url_path} HTTP {resp.status} (attempt {attempt}/{POC_CALLBACK_MAX_RETRIES})")
+                        logger.warning(f"Callback to {log_target} HTTP {resp.status} (attempt {attempt}/{POC_CALLBACK_MAX_RETRIES})")
                 except Exception as e:
-                    logger.warning(f"Callback to {url_path} failed: {e} (attempt {attempt}/{POC_CALLBACK_MAX_RETRIES})")
+                    logger.warning(f"Callback to {log_target} failed: {type(e).__name__} (attempt {attempt}/{POC_CALLBACK_MAX_RETRIES})")
 
                 if attempt < POC_CALLBACK_MAX_RETRIES:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, POC_CALLBACK_RETRY_MAX_BACKOFF_SEC)
 
-            logger.error(f"Callback to {url_path} failed after {POC_CALLBACK_MAX_RETRIES} attempts, giving up")
+            logger.error(f"Callback to {log_target} failed after {POC_CALLBACK_MAX_RETRIES} attempts, giving up")
             return False
 
 

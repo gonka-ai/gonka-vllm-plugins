@@ -145,7 +145,7 @@ class PoCInitGenerateRequest(BaseModel):
     n_groups: int = 1
     batch_size: int = POC_BATCH_SIZE_DEFAULT
     params: PoCParamsModel
-    url: Optional[str] = None
+    url: Optional[str] = Field(default=None, repr=False)
     poc_stronger_rng: bool = False
 
 
@@ -208,7 +208,7 @@ class PoCGenerateRequest(BaseModel):
     params: PoCParamsModel
     batch_size: int = POC_BATCH_SIZE_DEFAULT
     wait: bool = False
-    url: Optional[str] = None
+    url: Optional[str] = Field(default=None, repr=False)
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
     poc_stronger_rng: bool = False

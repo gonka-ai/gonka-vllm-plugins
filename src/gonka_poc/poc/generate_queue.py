@@ -40,7 +40,7 @@ class GenerateJob:
     stat_test_p_mismatch: float = DEFAULT_P_MISMATCH
     stat_test_fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
     stat_test_min_count: int = 0
-    callback_url: Optional[str] = None
+    callback_url: Optional[str] = field(default=None, repr=False)
     created_at: float = field(default_factory=time.time)
 
 

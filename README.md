@@ -233,6 +233,11 @@ The two generation paths deliver callbacks differently:
     `n_total`, `n_mismatch`, `mismatch_nonces`, `p_value`,
     `fraud_detected`, `insufficient_sample`, `n_excluded`, `excluded_nonces`.
 
+Callback URL prefixes are opaque and may contain authentication tokens. The
+plugin preserves them for delivery, omits them from request/job repr output,
+and logs only the callback origin during retries. Reverse-proxy access logs
+and other infrastructure must also protect these credentials.
+
 ### Pointing the chain orchestrator at the OpenAI endpoint
 
 The OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/completions`,
