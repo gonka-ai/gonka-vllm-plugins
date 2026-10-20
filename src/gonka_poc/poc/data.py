@@ -43,6 +43,7 @@ def fraud_test(
     n_total: int,
     p_mismatch: float = DEFAULT_P_MISMATCH,
     fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD,
+    min_n: int = 0,
 ) -> Tuple[float, bool]:
     """
     Run binomial test for fraud detection.
@@ -56,7 +57,7 @@ def fraud_test(
     Returns:
         (p_value, fraud_detected)
     """
-    if n_total == 0:
+    if n_total == 0 or n_total < min_n:
         return 1.0, False
 
     result = binomtest(

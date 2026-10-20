@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from vllm.logger import init_logger
 from gonka_poc._compat import current as _compat_current
@@ -192,6 +192,7 @@ class StatTestModel(BaseModel):
     dist_threshold: float = DEFAULT_DIST_THRESHOLD
     p_mismatch: float = DEFAULT_P_MISMATCH
     fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
+    min_count: int = Field(default=0, ge=0)
 
 
 class PoCGenerateRequest(BaseModel):
@@ -654,6 +655,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             stat_test_dist_threshold=stat_test.dist_threshold,
             stat_test_p_mismatch=stat_test.p_mismatch,
             stat_test_fraud_threshold=stat_test.fraud_threshold,
+            stat_test_min_count=stat_test.min_count,
             callback_url=body.url,
         )
         
@@ -722,6 +724,8 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         p_mismatch=stat_test.p_mismatch,
         fraud_threshold=stat_test.fraud_threshold,
         k_dim=body.params.k_dim,
+        min_n=stat_test.min_count,
+        requested_nonces=body.nonces,
     )
     
     return {
