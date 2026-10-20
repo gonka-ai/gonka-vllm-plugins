@@ -1,5 +1,5 @@
 """PoC artifact validation logic."""
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -62,16 +62,31 @@ def run_validation(
     p_mismatch: float = DEFAULT_P_MISMATCH,
     fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD,
     k_dim: int = 12,
+    min_n: int = 0,
+    requested_nonces: Optional[List[int]] = None,
 ) -> Dict:
     """Run full validation with fraud test.
     
     Returns:
-        Dict with n_total, n_mismatch, mismatch_nonces, p_value, fraud_detected
+        Dict with n_total, n_mismatch, mismatch_nonces, p_value, fraud_detected,
+        insufficient_sample, n_excluded, excluded_nonces
     """
+    excluded: List[int] = []
+    if requested_nonces is not None:
+        requested = set(requested_nonces)
+        scored: Dict[int, Dict] = {}
+        for artifact in computed_artifacts:
+            nonce = artifact["nonce"]
+            if nonce in requested and nonce in validation_map and nonce not in scored:
+                scored[nonce] = artifact
+        computed_artifacts = list(scored.values())
+        excluded = sorted(requested - scored.keys())
+        n_total = len(computed_artifacts)
+
     n_mismatch, mismatch_nonces = validate_artifacts(
         computed_artifacts, validation_map, dist_threshold, k_dim
     )
-    p_value, fraud_detected = fraud_test(n_mismatch, n_total, p_mismatch, fraud_threshold)
+    p_value, fraud_detected = fraud_test(n_mismatch, n_total, p_mismatch, fraud_threshold, min_n)
     
     return {
         "n_total": n_total,
@@ -79,4 +94,7 @@ def run_validation(
         "mismatch_nonces": mismatch_nonces,
         "p_value": p_value,
         "fraud_detected": fraud_detected,
+        "insufficient_sample": n_total == 0 or (0 < min_n and n_total < min_n),
+        "n_excluded": len(excluded),
+        "excluded_nonces": excluded,
     }

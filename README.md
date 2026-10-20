@@ -169,7 +169,7 @@ Computes artifacts for a fixed nonce list (either synchronous via
   "wait": false,
   "url": "https://chain-orchestrator.example/callback",
   "validation": { "artifacts": [{"nonce": 0, "vector_b64": "..."}, ...] },
-  "stat_test": { "dist_threshold": 0.4, "p_mismatch": 0.5, "fraud_threshold": 0.05 },
+  "stat_test": { "dist_threshold": 0.4, "p_mismatch": 0.1, "fraud_threshold": 0.05, "min_count": 200 },
   "poc_stronger_rng": false
 }
 ```
@@ -178,6 +178,12 @@ Computes artifacts for a fixed nonce list (either synchronous via
   Pull the result later via `GET /api/v1/pow/generate/{request_id}`.
 * `wait=true` blocks until artifacts are computed; if `validation` is
   attached, runs the L2 statistical test and returns the verdict inline.
+
+`min_count` defaults to zero (disabled). Validation counts distinct requested
+nonces with computed artifacts, excluding outputs lost by the runner. Below
+the minimum, or for an empty scored sample, the result carries
+`insufficient_sample=true`; consumers must abstain rather than treat
+`fraud_detected=false` as an acceptance vote.
 
 ### `GET /api/v1/pow/status`
 
@@ -219,7 +225,7 @@ The two generation paths deliver callbacks differently:
   * `validation` attached -> POST to `{url}/validated` with the verdict:
     `request_id`, block_hash, block_height, public_key, node_id,
     `n_total`, `n_mismatch`, `mismatch_nonces`, `p_value`,
-    `fraud_detected`.
+    `fraud_detected`, `insufficient_sample`, `n_excluded`, `excluded_nonces`.
 
 ### Pointing the chain orchestrator at the OpenAI endpoint
 
