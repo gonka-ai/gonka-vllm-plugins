@@ -39,6 +39,7 @@ class GenerateJob:
     stat_test_dist_threshold: float = DEFAULT_DIST_THRESHOLD
     stat_test_p_mismatch: float = DEFAULT_P_MISMATCH
     stat_test_fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
+    stat_test_min_count: int = 0
     callback_url: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
@@ -280,6 +281,8 @@ class GenerateQueue:
             p_mismatch=job.stat_test_p_mismatch,
             fraud_threshold=job.stat_test_fraud_threshold,
             k_dim=job.k_dim,
+            min_n=job.stat_test_min_count,
+            requested_nonces=job.nonces,
         )
         
         return {
@@ -305,6 +308,11 @@ class GenerateQueue:
                 "encoding": result.get("encoding", {}),
             }
             self._callback_queue.enqueue(job.callback_url, "generated", payload)
+        elif result.get("insufficient_sample", False):
+            logger.warning(
+                f"PoC queue job {job.request_id[:8]}: insufficient sample "
+                f"(n_total={result.get('n_total', 0)}, n_excluded={result.get('n_excluded', 0)}), no validation callback"
+            )
         else:
             payload = {
                 "request_id": job.request_id,
@@ -317,6 +325,8 @@ class GenerateQueue:
                 "mismatch_nonces": result.get("mismatch_nonces", []),
                 "p_value": result.get("p_value", 1.0),
                 "fraud_detected": result.get("fraud_detected", False),
+                "n_excluded": result.get("n_excluded", 0),
+                "excluded_nonces": result.get("excluded_nonces", []),
             }
             self._callback_queue.enqueue(job.callback_url, "validated", payload)
 
