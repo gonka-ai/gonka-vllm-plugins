@@ -13,6 +13,7 @@ with the other. Selecting per request would mean two derivations behind one
 endpoint, which is why this is a launch flag.
 """
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from gonka_poc._compat import current as _compat_current
@@ -71,22 +72,39 @@ async def execute_poc_forward_rpc(
             logger.warning("PoC pre-chunk abort failed: %s", exc)
 
     timeout_sec = timeout_ms / 1000.0
-    results = await engine_client.collective_rpc(
-        "execute_poc_forward",
-        timeout=timeout_sec,
-        kwargs={
-            "block_hash": block_hash,
-            "public_key": public_key,
-            "nonces": list(nonces),
-            "seq_len": int(seq_len),
-            "k_dim": int(k_dim),
-            "poc_stronger_rng": bool(poc_stronger_rng),
-            "borrowed_block_ids": (
-                list(lease["block_ids"]) if lease else None),
-            "borrowed_stripe": (
-                int(lease["blocks_per_seq"]) if lease else None),
-        },
-    )
+    sub = int(os.environ.get("POC_PP_SUBBATCH", "0"))
+    if sub > 0 and lease is None and len(nonces) > sub:
+        # One RPC, several batches: lets pipeline-parallel ranks overlap.
+        batches = [list(nonces[i:i + sub]) for i in range(0, len(nonces), sub)]
+        results = await engine_client.collective_rpc(
+            "execute_poc_forward_multi",
+            timeout=timeout_sec * len(batches),
+            kwargs={
+                "block_hash": block_hash,
+                "public_key": public_key,
+                "nonce_batches": batches,
+                "seq_len": int(seq_len),
+                "k_dim": int(k_dim),
+                "poc_stronger_rng": bool(poc_stronger_rng),
+            },
+        )
+    else:
+        results = await engine_client.collective_rpc(
+            "execute_poc_forward",
+            timeout=timeout_sec,
+            kwargs={
+                "block_hash": block_hash,
+                "public_key": public_key,
+                "nonces": list(nonces),
+                "seq_len": int(seq_len),
+                "k_dim": int(k_dim),
+                "poc_stronger_rng": bool(poc_stronger_rng),
+                "borrowed_block_ids": (
+                    list(lease["block_ids"]) if lease else None),
+                "borrowed_stripe": (
+                    int(lease["blocks_per_seq"]) if lease else None),
+            },
+        )
 
     # Aggregate per-rank artifacts. In a PP topology only the last rank
     # populates artifacts; in TP-only it's typically the driver rank

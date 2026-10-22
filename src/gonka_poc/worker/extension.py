@@ -154,6 +154,144 @@ class PoCWorkerExtension:
 
         return {"artifacts": artifacts, "rank": rank}
 
+    def execute_poc_forward_multi(
+        self,
+        *,
+        block_hash: str,
+        public_key: str,
+        nonce_batches: List[List[int]],
+        seq_len: int,
+        k_dim: int = 12,
+        poc_stronger_rng: bool = False,
+    ) -> Dict[str, Any]:
+        """Several prefill batches in one RPC, back to back on every rank.
+
+        Under pipeline parallelism the first rank runs its layers for batch
+        k+1 while the last rank runs its layers for batch k: the send of one
+        batch's hidden state only has to match the next rank's receive, so
+        the ranks settle one batch apart and both stay busy. A single-batch
+        RPC leaves each rank idle while the other works.
+        """
+        import time
+
+        from vllm.logger import init_logger
+        log = init_logger(__name__)
+        artifacts: List[Dict[str, Any]] = []
+        times = []
+        for batch in nonce_batches:
+            t0 = time.time()
+            res = self.execute_poc_forward(
+                block_hash=block_hash, public_key=public_key, nonces=list(batch),
+                seq_len=seq_len, k_dim=k_dim, poc_stronger_rng=poc_stronger_rng)
+            times.append(time.time() - t0)
+            artifacts.extend(res.get("artifacts", []) or [])
+        log.info("PoC multi-batch forward: %d batches x %d nonces, per batch %s s",
+                 len(nonce_batches), len(nonce_batches[0]) if nonce_batches else 0,
+                 " ".join(f"{t:.2f}" for t in times))
+        return {"artifacts": artifacts, "rank": int(getattr(self, "rank", -1))}
+
+    # ------------------------------------------------------------------ #
+    # Worker-side continuous prefill mining: a thread per rank keeps the
+    # pipeline fed between the API's polls, so no RPC boundary drains it.
+    # ------------------------------------------------------------------ #
+
+    def execute_poc_mine_start(
+        self,
+        *,
+        block_hash: str,
+        public_key: str,
+        seq_len: int,
+        k_dim: int,
+        poc_stronger_rng: bool,
+        node_id: int,
+        n_nodes: int,
+        group_id: int,
+        n_groups: int,
+        sub_batch: int,
+    ) -> Dict[str, Any]:
+        import threading
+        import time
+
+        from vllm.logger import init_logger
+        log = init_logger(__name__)
+        st = getattr(self, "_poc_mine", None)
+        if st is not None and st["thread"].is_alive():
+            return {"rank": int(getattr(self, "rank", -1)), "error": "already mining"}
+        st = {"stop_at": None, "started": 0, "done": 0, "buf": [], "lock": threading.Lock(),
+              "error": None, "times": [], "thread": None}
+        offset = node_id + group_id * n_nodes
+        step = n_groups * n_nodes
+
+        def loop():
+            import torch
+            torch.cuda.set_device(self.device)  # per-thread CUDA device, else NCCL sees device 0
+            x = 0
+            try:
+                while True:
+                    with st["lock"]:
+                        if st["stop_at"] is not None and st["started"] >= st["stop_at"]:
+                            break
+                        st["started"] += 1
+                    nonces = [offset + (x + i) * step for i in range(sub_batch)]
+                    x += sub_batch
+                    t0 = time.time()
+                    res = self.execute_poc_forward(
+                        block_hash=block_hash, public_key=public_key, nonces=nonces,
+                        seq_len=seq_len, k_dim=k_dim, poc_stronger_rng=poc_stronger_rng)
+                    with st["lock"]:
+                        st["buf"].extend(res.get("artifacts", []) or [])
+                        st["done"] += 1
+                        st["times"].append(time.time() - t0)
+            except Exception as e:  # reported through poll
+                log.error("PoC worker mining loop failed: %r", e, exc_info=True)
+                with st["lock"]:
+                    st["error"] = repr(e)
+
+        st["thread"] = threading.Thread(target=loop, name="poc-mine", daemon=True)
+        self._poc_mine = st
+        st["thread"].start()
+        return {"rank": int(getattr(self, "rank", -1))}
+
+    def execute_poc_mine_poll(self) -> Dict[str, Any]:
+        st = getattr(self, "_poc_mine", None)
+        if st is None:
+            return {"artifacts": [], "started": 0, "done": 0, "alive": False, "error": "not mining"}
+        with st["lock"]:
+            arts, st["buf"] = st["buf"], []
+            return {"artifacts": arts, "started": st["started"], "done": st["done"],
+                    "alive": st["thread"].is_alive(), "error": st["error"],
+                    "rank": int(getattr(self, "rank", -1))}
+
+    def execute_poc_mine_flag(self) -> Dict[str, Any]:
+        """Stop taking new batches once ``started`` reaches the number returned
+        here; the caller then sets the same target on every rank so that a
+        batch one PP rank already started is still received by the next."""
+        st = getattr(self, "_poc_mine", None)
+        if st is None:
+            return {"started": 0}
+        with st["lock"]:
+            st["stop_at"] = st["started"]
+            return {"started": st["started"]}
+
+    def execute_poc_mine_stop(self, *, stop_at: int) -> Dict[str, Any]:
+        st = getattr(self, "_poc_mine", None)
+        if st is None:
+            return {"artifacts": [], "done": 0}
+        with st["lock"]:
+            st["stop_at"] = max(int(stop_at), st["started"])
+        st["thread"].join(timeout=300)
+        # Give the mining activations back to the driver: live inference (and
+        # NCCL's own cudaMalloc) must not find the card full after a round.
+        import torch
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        with st["lock"]:
+            arts, st["buf"] = st["buf"], []
+            t = st["times"]
+            return {"artifacts": arts, "done": st["done"], "alive": st["thread"].is_alive(),
+                    "error": st["error"], "rank": int(getattr(self, "rank", -1)),
+                    "per_batch_s": (sum(t[2:]) / max(1, len(t) - 2)) if len(t) > 2 else None}
+
     def execute_poc_borrow_compat(self) -> Dict[str, Any]:
         """Report whether borrowed-lease validation is bit-safe on this rank.
 

@@ -138,15 +138,72 @@ def generate_inputs(
     device: torch.device,
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """Generate deterministic input embeddings for PoC."""
+    """Generate deterministic input embeddings for PoC.
+
+    One Triton launch draws every nonce: the same per-element murmur3 and
+    Box-Muller as the per-nonce torch loop, rounded the same way (checked
+    bit for bit), without the loop's launches and int64 temporaries."""
+    seeds = [_seed_from_string(f"{block_hash}_{public_key}_nonce{nonce}") for nonce in nonces]
+    n = seq_len * dim
+    if _triton_inputs is not None and dtype in (torch.bfloat16, torch.float16) and device.type == "cuda":
+        return _triton_inputs(seeds, n, device, dtype).view(len(nonces), seq_len, dim)
     batch_size = len(nonces)
     result = torch.empty(batch_size, seq_len, dim, device=device, dtype=dtype)
-    for i, nonce in enumerate(nonces):
-        seed_str = f"{block_hash}_{public_key}_nonce{nonce}"
-        seed = _seed_from_string(seed_str)
-        normal = _normal(seed, seq_len * dim, device)
+    for i, seed in enumerate(seeds):
+        normal = _normal(seed, n, device)
         result[i] = normal.view(seq_len, dim).to(dtype)
     return result
+
+
+try:
+    import triton
+    import triton.language as tl
+    from triton.language.extra.cuda import libdevice
+
+    @triton.jit
+    def _murmur_t(key, seed):
+        M: tl.constexpr = 0xFFFFFFFF
+        h = seed & M
+        k = key & M
+        k = (k * 0xCC9E2D51) & M
+        k = ((k << 15) | (k >> 17)) & M
+        k = (k * 0x1B873593) & M
+        h = h ^ k
+        h = ((h << 13) | (h >> 19)) & M
+        h = (h * 5 + 0xE6546B64) & M
+        h = h ^ (h >> 16)
+        h = (h * 0x85EBCA6B) & M
+        h = h ^ (h >> 13)
+        h = (h * 0xC2B2AE35) & M
+        h = h ^ (h >> 16)
+        return h
+
+    @triton.jit
+    def _inputs_kernel(o_ptr, seed_ptr, N, NP, BLOCK: tl.constexpr):
+        # _normal(seed, N): u = murmur(0..2*NP-1)/2^32, z0 = sqrt(-2 log u1) cos(2 pi u2), z1 = ... sin, cat[z0, z1][:N]
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        cm = cols < N
+        seed = tl.load(seed_ptr + row)
+        first = cols < NP
+        i1 = tl.where(first, cols, cols - NP)
+        i2 = tl.where(first, cols + NP, cols)
+        u1 = libdevice.div_rn(_murmur_t(i1, seed).to(tl.float32), 4294967296.0)
+        u2 = libdevice.div_rn(_murmur_t(i2, seed).to(tl.float32), 4294967296.0)
+        u1 = tl.maximum(u1, 1e-10)
+        r = libdevice.sqrt_rn(-2.0 * libdevice.log(u1))
+        ang = 6.283185307179586 * u2
+        z = tl.where(first, r * libdevice.cos(ang), r * libdevice.sin(ang))
+        tl.store(o_ptr + row * N + cols, z.to(o_ptr.dtype.element_ty), mask=cm)
+
+    def _triton_inputs(seeds, n, device, dtype):
+        out = torch.empty(len(seeds), n, device=device, dtype=dtype)
+        seed_t = torch.tensor(seeds, dtype=torch.int64, device=device)
+        _inputs_kernel[(len(seeds), triton.cdiv(n, 1024))](out, seed_t, n, (n + 1) // 2, BLOCK=1024,
+                                                             enable_fp_fusion=False)
+        return out
+except ImportError:  # pragma: no cover
+    _triton_inputs = None
 
 
 def generate_inputs_concat_murmur(
