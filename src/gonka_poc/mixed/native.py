@@ -156,12 +156,18 @@ class PoCEmbeddingWrapper(nn.Module):
         # the previous step's sampled-token plumbing) -> out-of-vocab gather crash.
         # Force masked (PoC) rows to a valid in-vocab id (0); their value is unused.
         n = input_ids.shape[0]
-        m_rows = self.poc_mask[:n]
         # PoC rows: poc_token_ids (seeded id on hash-MoE, else zeros — the id
         # reaches the MoE router via tid2eid, see _TOKEN_ID_ROUTED_MODELS).
-        input_ids = torch.where(m_rows, self.poc_token_ids[:n].to(input_ids.dtype),
-                                input_ids)
-        out = self._inner_call(input_ids)
+        input_ids = torch.where(self.poc_mask[:n],
+                                self.poc_token_ids[:n].to(input_ids.dtype), input_ids)
+        return self.inject(self._inner_call(input_ids))
+
+    def inject(self, out):
+        """``out`` with its PoC rows replaced by their PoC inputs; chat rows keep
+        theirs. The bridge also applies it to the runner's inputs_embeds when the
+        engine embeds the tokens before the forward (multimodal models)."""
+        n = out.shape[0]
+        m_rows = self.poc_mask[:n]
         m = m_rows.unsqueeze(-1)
         if not self._synth:
             return torch.where(m, self.poc_embeds[:n].to(out.dtype), out)
@@ -333,6 +339,7 @@ class PoCNativeState:
         self.row_group = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
         self.embeds = torch.zeros(max_tokens, hidden_size, device=device, dtype=dtype)
+        self.embed_wrapper = None   # PoCEmbeddingWrapper, set by attach_native_poc
         # (block_hash, nonce-or-None) -> per-layer vectors. nonce=None is the
         # per-block scheme (one draw shared by every nonce of the block); an int
         # nonce is the per-nonce scheme (each nonce gets its own draw).
@@ -636,6 +643,7 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
             state.embed_base, state.embed_prev_k, state.embed_step, hidden_size,
             state.poc_token_ids)
         _install_poc_patch(_emb, _wrap, state)
+        state.embed_wrapper = _wrap
     # SNAP = SAMPLING: patch the final norm in place, same reason as above.
     if embed_owner is not None and hasattr(embed_owner, "norm"):
         _nrm = embed_owner.norm

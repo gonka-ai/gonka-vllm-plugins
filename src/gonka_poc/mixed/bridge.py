@@ -3,8 +3,9 @@
 
 One bridge object per GPUModelRunner. Every hook is a no-op when the step holds
 no PoC rows, so the pure-chat path is untouched. Embeds/routing/reflection are
-applied IN-MODEL via native.py state (never through ``inputs_embeds`` — on 0.25
-external embeds force the engine off the compiled path).
+applied IN-MODEL via native.py state (not through ``inputs_embeds`` — on 0.25
+external embeds force the engine off the compiled path), except where the engine
+itself feeds the model ``inputs_embeds``: multimodal models and prompt embeds.
 
 Runner anchors (5):
   load()        - load_model: attach native PoC state to the model
@@ -78,6 +79,9 @@ class PoCRunnerBridge:
         self.gated = False
         self._step: dict[str, Any] | None = None  # per-step mixed-batch info
         self._reqs: dict[str, _PoCRequestView] = {}
+        # The forward reads inputs_embeds that _preprocess built before
+        # pre_forward marked the PoC rows (set in load()).
+        self.embeds_before_forward = False
 
     # ------------------------------------------------------------- load_model
     def load(self, model: torch.nn.Module) -> None:
@@ -110,6 +114,13 @@ class PoCRunnerBridge:
         )
         # mixed_decode reads the state off the runner (0.20 contract).
         runner._poc_native = self.native
+        # The same conditions under which _preprocess embeds the tokens itself:
+        # a multimodal model (GLM-5.3 without --language-model-only) or prompt
+        # embeds. The token embedding then never runs inside the forward.
+        from vllm.distributed import get_pp_group
+        self.embeds_before_forward = get_pp_group().is_first_rank and (
+            (runner.supports_mm_inputs and not runner.model_config.is_encoder_decoder)
+            or bool(getattr(runner, "enable_prompt_embeds", False)))
         self.gated = bool(getattr(
             getattr(runner, "cudagraph_dispatcher", None), "poc_graphs", False))
         # Without torch.compile each wrapper op is its own kernel; fuse them.
@@ -221,6 +232,9 @@ class PoCRunnerBridge:
                                 row_refl_nonces[r] = pp.nonce
                 self.native.set_row_block_hashes(row_hashes, row_refl_nonces)
                 self.native.set_routing(row_hashes, row_nonces, row_steps)
+            if self.embeds_before_forward and self.native.embed_wrapper is not None:
+                buf = self.runner.inputs_embeds.gpu[:embeds.shape[0]]
+                buf.copy_(self.native.embed_wrapper.inject(buf))
 
     def _batch_view(self) -> tuple:
         ib = self.runner.input_batch
