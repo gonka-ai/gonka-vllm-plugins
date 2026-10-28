@@ -165,6 +165,12 @@ class PoCWorkerExtension:
         return {"scratch_capable": False,
                 "rank": int(getattr(self, "rank", -1))}
 
+    def execute_infval_take(self, tags: List[str]) -> Dict[str, Any]:
+        """Pop the tape signals this rank recorded for finished replays."""
+        from gonka_poc.infval.processor import take
+
+        return take(list(tags))
+
 
 # Public alias used in the ``--worker-extension-cls`` CLI string.
 __all__ = ["PoCWorkerExtension"]

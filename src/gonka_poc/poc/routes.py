@@ -27,6 +27,7 @@ from gonka_poc.poc.reservation import (
     reset_prefix_cache_after_inplace_poc,
 )
 from gonka_poc.poc.validation import run_validation
+from gonka_poc.infval.routes import router as infval_router
 from gonka_poc._compat import current as _compat_current
 
 logger = logging.getLogger(__name__)
@@ -870,3 +871,8 @@ async def stop_round(request: Request) -> dict:
     # trajectory in it comes out different. Report STOPPED only once idle.
     await drain_poc()
     return {"status": "OK", "pow_status": {"status": "STOPPED"}}
+
+
+# The engine adds this router's routes to the app one by one; the infval
+# routes ride along at their own paths.
+router.routes.extend(infval_router.routes)

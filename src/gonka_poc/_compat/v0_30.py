@@ -63,7 +63,17 @@ def build_common_attention_metadata(
     )
 
 
+def logits_processor_api() -> tuple[Any, Any]:
+    """``(LogitsProcessor, process_dict_updates)`` for a custom V1 logits
+    processor: the base class and its batch-update helper."""
+    from vllm.v1.sample.logits_processor import LogitsProcessor
+    from vllm.v1.sample.logits_processor.builtin import process_dict_updates
+
+    return LogitsProcessor, process_dict_updates
+
+
 __all__ = [
+    "logits_processor_api",
     "build_common_attention_metadata",
     "build_attn_metadata_per_group",
     "get_kv_cache_pool",
