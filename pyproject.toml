@@ -51,6 +51,9 @@ Issues = "https://github.com/kaitakuai/gonka-poc/issues"
 [project.entry-points."vllm.general_plugins"]
 gonka_poc = "gonka_poc.plugin:register"
 
+[project.entry-points."vllm.logits_processors"]
+gonka_tape = "gonka_poc.infval.processor:TapeLogitsProcessor"
+
 [project.scripts]
 gonka-vllm-serve = "gonka_poc.entrypoint.api_router:main"
 
