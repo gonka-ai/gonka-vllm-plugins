@@ -28,7 +28,8 @@ def poc_forward_context():
     global _poc_forward_active_flag
     _poc_forward_active_flag = True
     try:
-        yield
+        with fused.model_ops():
+            yield
     finally:
         _poc_forward_active_flag = False
 
