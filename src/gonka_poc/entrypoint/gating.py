@@ -28,6 +28,7 @@ logger = logging.getLogger("gonka_poc.entrypoint.gating")
 DEFAULT_BLOCKED_PREFIXES: tuple[str, ...] = (
     "/v1/chat/completions",
     "/v1/completions",
+    "/api/v1/infval/",
 )
 
 

@@ -119,6 +119,8 @@ def slice_sampling_metadata(sm, rows, device):
     # not decode-PoC). Slice it when the base engine carries it.
     if hasattr(sm, "enforced_next_token_ids"):
         sliced.enforced_next_token_ids = take_t(sm.enforced_next_token_ids)
+    if getattr(sm, "tape", None) is not None:
+        sliced.tape = sm.tape.select(remap)
     return sliced
 
 
