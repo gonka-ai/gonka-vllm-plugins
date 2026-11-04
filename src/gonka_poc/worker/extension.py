@@ -167,7 +167,7 @@ class PoCWorkerExtension:
 
     def execute_infval_take(self, tags: List[str]) -> Dict[str, Any]:
         """Pop the tape signals this rank recorded for finished replays."""
-        from gonka_poc.infval.processor import take
+        from vllm.v1.sample.tape import take
 
         return take(list(tags))
 

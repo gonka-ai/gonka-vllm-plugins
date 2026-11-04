@@ -63,17 +63,32 @@ def build_common_attention_metadata(
     )
 
 
-def logits_processor_api() -> tuple[Any, Any]:
-    """``(LogitsProcessor, process_dict_updates)`` for a custom V1 logits
-    processor: the base class and its batch-update helper."""
-    from vllm.v1.sample.logits_processor import LogitsProcessor
-    from vllm.v1.sample.logits_processor.builtin import process_dict_updates
+async def collective_rpc_each_engine(client: Any, method: str, args: tuple) -> list:
+    """``collective_rpc`` on every engine core, results flattened in engine order.
 
-    return LogitsProcessor, process_dict_updates
+    With data parallelism ``call_utility_async`` runs on all engines but returns
+    only the first engine's result; state kept in a worker of another engine is
+    popped and lost.
+    """
+    import asyncio
+
+    core = client.engine_core
+    engines = getattr(core, "core_engines", None)
+    if not engines or len(engines) == 1:
+        return await core.collective_rpc_async(method, args=args)
+    per_engine = await asyncio.gather(
+        *[
+            core._call_utility_async(
+                "collective_rpc", method, None, args, {}, engine=engine
+            )
+            for engine in engines
+        ]
+    )
+    return [result for results in per_engine for result in results]
 
 
 __all__ = [
-    "logits_processor_api",
+    "collective_rpc_each_engine",
     "build_common_attention_metadata",
     "build_attn_metadata_per_group",
     "get_kv_cache_pool",

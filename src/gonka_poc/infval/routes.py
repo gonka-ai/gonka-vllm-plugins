@@ -2,7 +2,7 @@
 
 One call returns both, so a proxy that spreads requests over several vLLM
 instances cannot split a replay from its signals. The signals are recorded in
-the worker (``processor``) and collected with ``collective_rpc``.
+the worker by the sampler and collected with ``collective_rpc``.
 """
 import uuid
 
@@ -14,7 +14,12 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
 )
 
-from gonka_poc.infval.processor import GREEDY_ARG, TAG_ARG, TAPE_ARG
+from gonka_poc._compat import current as _compat_current
+
+TAPE_ARG = "gonka_tape"
+TAG_ARG = "gonka_tape_tag"
+LEN_ARG = "gonka_tape_len"
+GREEDY_ARG = "gonka_tape_greedy"
 
 router = APIRouter(prefix="/api/v1/infval", tags=["infval"])
 
@@ -29,8 +34,9 @@ async def replay_chat_completion(request: ChatCompletionRequest,
     if xargs.get(TAPE_ARG) and request.enforced_tokens:
         tag = uuid.uuid4().hex
         xargs[TAG_ARG] = tag
-        # A greedy request is replayed at T=1 so that the processor's slot
-        # runs; the processor then scores against the plain argmax.
+        xargs[LEN_ARG] = len(request.enforced_tokens.tokens)
+        # A greedy request is replayed at T=1 so that the tape slot runs; the
+        # sampler then scores against the plain argmax.
         if request.temperature is not None and request.temperature < 1e-5:
             request.temperature = 1.0
             xargs[GREEDY_ARG] = 1
@@ -45,7 +51,7 @@ async def replay_chat_completion(request: ChatCompletionRequest,
                             status_code=response.error.code)
     body = response.model_dump()
     if tag is not None:
-        ranks = await state.engine_client.collective_rpc(
-            "execute_infval_take", args=([tag],))
+        ranks = await _compat_current().collective_rpc_each_engine(
+            state.engine_client, "execute_infval_take", ([tag],))
         body["gonka_tape"] = next((r[tag] for r in ranks if tag in r), None)
     return JSONResponse(body)
