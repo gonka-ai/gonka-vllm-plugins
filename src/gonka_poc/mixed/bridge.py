@@ -143,8 +143,15 @@ class PoCRunnerBridge:
             if r.poc_params is not None:
                 self._reqs[r.req_id] = _PoCRequestView(
                     r.req_id, r.poc_params, r.num_computed_tokens)
+        from vllm.distributed import get_pp_group
+
+        pp = get_pp_group()
         for rid in scheduler_output.finished_req_ids:
             self._reqs.pop(rid, None)
+            if pp.world_size > 1 and not pp.is_last_rank:
+                # Only the last rank reaches extract(), which is what frees a
+                # finished row's decode state; the other ranks free it here.
+                mixed_decode.get_decode_manager(self.runner).free(rid)
         if not self._reqs:
             self._step = None
             return self.set_active(False)
@@ -173,8 +180,42 @@ class PoCRunnerBridge:
             "poc_requests": poc_requests,
             "poc_metadata": None,
             "poc_position_mask": None,
+            "pp_handover": self._pp_handover(scheduler_output, poc_requests)
+            if pp.world_size > 1 else [],
         }
         return self.set_active(True)
+
+    @staticmethod
+    def _pp_handover(scheduler_output, poc_requests) -> list[str]:
+        """Rows whose prev_k the last rank hands to the other ranks after this
+        step, in nonce order: decode-PoC rows whose prefill is complete at the
+        end of the step and that still have a decode step after it. Derived
+        from the scheduler output alone, so every rank gets the same list."""
+        rows = []
+        for req in poc_requests:
+            pp_ = req.poc_params
+            if pp_.max_tokens <= 0:
+                continue
+            done = (req.num_computed_tokens
+                    + scheduler_output.num_scheduled_tokens[req.req_id])
+            if pp_.seq_len <= done < pp_.seq_len + pp_.max_tokens:
+                rows.append(req.req_id)
+        return rows
+
+    def pp_recv_prev_k(self) -> None:
+        """Non-last PP ranks, at sample time: join the last rank's prev_k
+        broadcast (sent from extract) and store the values. No collective when
+        the step has nothing to hand over."""
+        if self._step is None:
+            return
+        rows = self._step.pop("pp_handover", None)
+        if not rows:
+            return
+        from vllm.distributed import get_pp_group
+
+        pp = get_pp_group()
+        if pp.world_size > 1 and not pp.is_last_rank:
+            mixed_decode.pp_recv_prev_k(self.runner, rows, pp)
 
     def set_active(self, active: bool) -> bool:
         """Whether the in-model PoC transforms run in the coming forwards
@@ -246,6 +287,11 @@ class PoCRunnerBridge:
             return None
         out = mixed_decode.process_poc_outputs_from_hidden(
             self.runner, hidden_states, self._step["poc_metadata"])
+        rows = self._step.pop("pp_handover", None)
+        if rows:
+            from vllm.distributed import get_pp_group
+
+            mixed_decode.pp_send_prev_k(self.runner, rows, get_pp_group())
         if out:
             mgr = mixed_decode.get_decode_manager(self.runner)
             for rid in out:

@@ -245,6 +245,33 @@ def setup_decode_poc(runner, poc_requests) -> bool:
     return True
 
 
+def pp_send_prev_k(runner, req_ids, pp) -> None:
+    """Last rank: hand the chain value (prev_k) of ``req_ids`` to the other
+    pipeline ranks.
+
+    prev_k is produced by the final-norm snap, which only the last rank runs,
+    yet every rank consumes it when it builds the next decode-step inputs. This
+    runs at sample time, where vLLM matches its own last-rank -> other-ranks
+    sampled-token hand-over; a collective earlier in the step deadlocks against
+    the worker's intermediate-tensor receive. ``req_ids`` comes from the
+    scheduler output alone, so every rank agrees on it.
+    """
+    mgr = get_decode_manager(runner)
+    states = [mgr.get(rid) for rid in req_ids]
+    pp.broadcast_tensor_dict(
+        {"prev_k": _cat_prev_k(states, "pp-broadcast")},
+        src=len(pp.ranks) - 1)
+
+
+def pp_recv_prev_k(runner, req_ids, pp) -> None:
+    """Non-last ranks: counterpart of ``pp_send_prev_k``."""
+    recv = pp.broadcast_tensor_dict(None, src=len(pp.ranks) - 1)
+    prev_k = recv["prev_k"]
+    mgr = get_decode_manager(runner)
+    for i, rid in enumerate(req_ids):
+        mgr.get(rid).prev_k_t = prev_k[i:i + 1]
+
+
 # ---------------------------------------------------------------------------
 # Mixed-batch model-runner helpers (moved out of gpu_model_runner.py to keep the
 # core vLLM footprint minimal). Each takes the GPUModelRunner as `runner`.
